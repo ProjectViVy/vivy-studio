@@ -6,8 +6,8 @@
 
 ## 位置
 
-- **源码位置**: `studio/dsh-plugin-hub/`（Vivy 仓库内）
-- **Profile 配置**: `data/studio-home/profiles/vivy-studio/package.json`
+- **源码位置**: `studio/dsh-plugin-hub/`（git submodule [`ProjectViVy/vivy-studio`](https://github.com/ProjectViVy/vivy-studio) 挂载在 `agent-vivy` 的 `studio/`）
+- **Profile 配置**: `data/studio-home/profiles/vivy-studio/package.json`（宿主 `agent-vivy` 的 Studio scratch，不在本子模块仓）
 
 ## 架构特点
 
@@ -25,8 +25,8 @@
 
 这意味着：
 - **永久生效**：修改源码后重启 Vivy Studio 即生效
-- **版本控制**：与 Vivy 仓库一起管理
-- **可魔改**：直接编辑 `studio/dsh-plugin-hub/` 下的文件
+- **版本控制**：改动提交到 `ProjectViVy/vivy-studio`；宿主 `agent-vivy` 只推进 `studio` gitlink SHA
+- **可魔改**：直接编辑 `studio/dsh-plugin-hub/` 下的文件（在子模块工作树内 commit/push）
 
 ### ✅ DSH Bundle 声明
 
@@ -101,8 +101,8 @@ npm run build:client
 
 如果修改导致问题，可以通过以下方式回滚：
 
-1. **Git 回滚**：`git checkout -- studio/dsh-plugin-hub/`
-2. **移除依赖**：从 `data/studio-home/profiles/vivy-studio/package.json` 中删除 `dsh-plugin-hub` 相关行
+1. **Git 回滚**：在子模块内 `git -C studio checkout -- dsh-plugin-hub/`（或重置整个 `studio` 到宿主钉住的 SHA）
+2. **移除依赖**：从 `data/studio-home/profiles/vivy-studio/package.json` 中删除 `dsh-plugin` 相关行
 3. **重新安装**：`cd data/studio-home/profiles/vivy-studio && pnpm install`
 
 ## 注意事项
@@ -130,9 +130,9 @@ pnpm install
 
 对于 Vivy Studio 的第一方开发，应该直接修改源码树中的 bundle，而不是通过 `dsh plugin add` 安装外部包。后者会安装到 profile 的 `node_modules` 中，不在版本控制范围内。
 
-✅ **正确做法**：编辑 `studio/dsh-plugin-hub/` → 提交 Git → 重启 Studio
+✅ **正确做法**：编辑 `studio/dsh-plugin-hub/` → 在 `vivy-studio` 子仓提交并 push → 宿主 bump `studio` gitlink → 重启 Studio
 
-❌ **错误做法**：`dsh plugin --profile vivy-studio add <remote-package>`
+❌ **错误做法**：`dsh plugin --profile vivy-studio add <remote-package>`；或把插件树重新 vendor 进 `agent-vivy` 主仓
 
 ---
 
@@ -151,7 +151,7 @@ pnpm install
 
 ## Vivy 源码安装模式（vivy-source-install）
 
-插件商城在 `vivy-studio` profile 下默认启用 **Vivy 源码安装**：把插件放进 Vivy 仓库 `studio/<plugin>/`，作为 `file:` bundle 注册进 Vivy Studio profile，而不是安装到系统 `DSH_HOME`。
+插件商城在 `vivy-studio` profile 下默认启用 **Vivy 源码安装**：把插件放进宿主挂载的 `studio/<plugin>/`（即 `vivy-studio` 子模块工作树），作为 `file:` bundle 注册进 Vivy Studio profile，而不是安装到系统 `DSH_HOME`。安装会弄脏子模块工作树；默认不要把安装噪声自动 commit 进 `vivy-studio` main。
 
 ### 行为（双流程）
 
