@@ -19,6 +19,8 @@ export interface HostInstalled {
   loaded: string[] | null
   /** 真正的 dsh 插件包名（包内声明 dsh 配置 / 在 profile bundles 清单）：非 dsh 插件（如官方示例仓库）装上也不会被宿主加载，不提示待重启 */
   dshCapable: string[] | null
+  /** Vivy 源码安装的插件：包名 → studio/ 下源码相对路径（卸载确认弹窗提示将删除源码目录） */
+  vivySourcePaths: Record<string, string> | null
 }
 
 /** 当前 profile 已安装插件表（npm 包名 -> manifest spec）+ 安装时记录的目录信号 + 安装路径 + 运行状态。 */
@@ -32,6 +34,7 @@ export async function fetchInstalled(): Promise<HostInstalled | null> {
       paths?: Record<string, string>
       loaded?: string[]
       dshCapable?: string[]
+      vivySourcePaths?: Record<string, string>
     }
     return {
       installed: data.installed ?? {},
@@ -39,6 +42,7 @@ export async function fetchInstalled(): Promise<HostInstalled | null> {
       paths: data.paths ?? null,
       loaded: data.loaded ?? null,
       dshCapable: data.dshCapable ?? null,
+      vivySourcePaths: data.vivySourcePaths ?? null,
     }
   } catch {
     return null

@@ -223,6 +223,8 @@ export interface UninstallModalProps {
   submitting: boolean
   /** 完成结果是否需重启才生效：true → 「稍后重启 / 立即重启」；false（loader 已即时移除）→ 仅「完成」 */
   needsRestart: boolean
+  /** Vivy 源码安装的源码相对路径（studio/<slug>）：非空时卸载会同时删除该源码目录，确认态给出风险提示 */
+  sourcePath?: string | null
   onClose: () => void
   onCancel: () => void
   onCopyCommand: () => void
@@ -232,7 +234,7 @@ export interface UninstallModalProps {
 
 /** 卸载确认弹窗：确认/进行中（后台队列，可关闭）；完成后切换为结果视图（成功即生效，仅「完成」关闭）。 */
 export function UninstallModal(props: UninstallModalProps) {
-  const { plugin, done, task, t, langPath, restarting, submitting, needsRestart, onClose, onCancel, onCopyCommand, onConfirm, onRestart } = props
+  const { plugin, done, task, t, langPath, restarting, submitting, needsRestart, sourcePath, onClose, onCancel, onCopyCommand, onConfirm, onRestart } = props
   const busy = submitting || (task !== null && (task.status === 'pending' || task.status === 'running'))
   // 进行中标题带上插件名，与安装弹窗一致，并用状态色区分
   const name = plugin.displayName ?? plugin.slug
@@ -278,6 +280,8 @@ export function UninstallModal(props: UninstallModalProps) {
             h(ConfirmIcon, { type: 'trash' }),
           ) : null,
           h('div', { className: styles.modalDesc }, t('uninstallDesc')),
+          // Vivy 源码安装：卸载会同时删除 studio/ 下的源码目录 —— 确认态里明确提示（琥珀警示条）
+          !busy && sourcePath ? h('div', { className: styles.failPrepareHint }, t('uninstallSourceDanger', { path: sourcePath })) : null,
           h('div', { className: styles.modalRow },
             h('span', { className: styles.modalLabel }, t('confirmPlugin')),
             h('span', { className: styles.modalValue, title: plugin.displayName ?? plugin.slug },

@@ -462,6 +462,12 @@ export function PluginHubSection({ t: _hostT, locale }: SectionProps) {
       restarting,
       submitting: queue.submitting,
       needsRestart: uninstallNeedsRestart,
+      // Vivy 源码安装的插件：把源码相对路径带给确认弹窗，提示卸载会同时删除该目录
+      sourcePath: uninstallItem
+        ? uninstallItem.vivySourcePath
+        : (uninstallPlugin
+            ? (catalog.installedItems.find((i) => i.name === catalog.installedName(uninstallPlugin))?.vivySourcePath ?? null)
+            : null),
       onClose: () => {
         setUninstallDone(false)
         setUninstallPlugin(null)

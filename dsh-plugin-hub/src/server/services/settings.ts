@@ -26,6 +26,8 @@ export interface HubSettings {
   logPath: string
   /** Vivy 源码安装模式：在 Vivy Studio 中默认把 GitHub 插件克隆到 Vivy 仓库的 studio/ 目录并注册为 file: bundle */
   vivySourceInstall: boolean
+  /** Vivy 源码插件自动提交：安装 / 更新 / 卸载源码插件后，自动把 studio/ 下该插件路径的改动 git 提交到 vivy-studio 子模块（卸载同时删除源码目录） */
+  vivySourceAutoCommit: boolean
 }
 
 export const DEFAULT_SETTINGS: HubSettings = {
@@ -36,6 +38,7 @@ export const DEFAULT_SETTINGS: HubSettings = {
   enableDshInstall: true,
   logPath: '',
   vivySourceInstall: true,
+  vivySourceAutoCommit: true,
 }
 
 export function settingsFile(profile: string): string {

@@ -148,6 +148,16 @@ export function SettingsView({ t, settings, update, reset, env, onCopy }: {
         title: t('settingsVivySource'),
       }),
     }),
+    // Vivy 源码插件自动提交开关：安装 / 更新 / 卸载后自动 commit 到 vivy-studio 仓库
+    h(SettingRow, {
+      title: t('settingsVivyCommit'),
+      desc: t('settingsVivyCommitDesc'),
+      children: h(Toggle, {
+        checked: settings.vivySourceAutoCommit,
+        onChange: (v) => update({ vivySourceAutoCommit: v }),
+        title: t('settingsVivyCommit'),
+      }),
+    }),
   )
 
   const securityCard = h('div', { className: styles.card },

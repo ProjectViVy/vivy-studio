@@ -65,6 +65,8 @@ export function useCatalog(lang: LocaleId) {
   const [loadedNames, setLoadedNames] = useState<string[] | null>(null)
   /** 真正的 dsh 插件包名（包内声明 dsh 配置 / 在 profile bundles 清单）：非 dsh 插件不提示「待重启」 */
   const [dshCapableNames, setDshCapableNames] = useState<string[] | null>(null)
+  /** Vivy 源码安装的插件：包名 → studio/ 下源码相对路径（卸载确认弹窗提示将删除源码目录） */
+  const [vivySourcePaths, setVivySourcePaths] = useState<Record<string, string> | null>(null)
 
   // 拉取目录 + 统计。在线 API 已只返回 verified；再过滤一次，保证只展示人工验证通过的插件。
   useEffect(() => {
@@ -128,6 +130,7 @@ export function useCatalog(lang: LocaleId) {
     setInstallPaths(data.paths)
     setLoadedNames(data.loaded)
     setDshCapableNames(data.dshCapable)
+    setVivySourcePaths(data.vivySourcePaths)
   }
 
   // 首次进入拉取已安装表（依赖宿主 webServer 服务）
@@ -141,8 +144,8 @@ export function useCatalog(lang: LocaleId) {
 
   /** 已安装项统一列表（目录元数据 + 运行时信息合并）：驱动「已安装」tab。 */
   const installedItems = useMemo<InstalledItem[]>(
-    () => installedItemsOf(plugins, installed, versions, installPaths, loadedNames, dshCapableNames),
-    [plugins, installed, versions, installPaths, loadedNames, dshCapableNames],
+    () => installedItemsOf(plugins, installed, versions, installPaths, loadedNames, dshCapableNames, vivySourcePaths),
+    [plugins, installed, versions, installPaths, loadedNames, dshCapableNames, vivySourcePaths],
   )
 
   /** 当前分类下的插件（「全部」时为整个目录）。 */

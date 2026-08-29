@@ -15,7 +15,7 @@ import { dirname, join, resolve } from 'node:path'
 import { spawn } from 'node:child_process'
 import { fetchViaCurl, probeUrl, systemProxy } from '../services/probe.ts'
 import { activeTask, cancelTask, dumpLoaderEntries, getTask, githubRepoOf, githubTarget, globalNpmPackagesOf, hasQueuedTarget, installTargetOf, listPendingRestarts, readProfileArg, startPluginMutation, validPackageName, type LoaderHandle } from '../services/install/install.ts'
-import { isVivySourceInstallEnabled } from '../services/install/vivy-source.ts'
+import { isVivySourceInstallEnabled, readVivySourceRegistry, resolveVivyRoot } from '../services/install/vivy-source.ts'
 import { recordInstalledVersion, recordResolvedNpmPackage, readInstalledVersions, removeInstalledVersion } from '../services/profile/installed-versions.ts'
 import { resolveNpmPackage } from '../services/install/npm-resolve.ts'
 import { preflightTarget } from '../services/install/preflight.ts'
@@ -302,7 +302,7 @@ export function mountPluginHubRoutes(webServer: WebServerService, profile: strin
           // 白名单字段：只接受已知设置项，防客户端把任意键写进文件
           const patch: Record<string, unknown> = {}
           const source = typeof body === 'object' && body !== null ? body as Record<string, unknown> : {}
-          for (const key of ['enableNpmInstall', 'enableGitInstall', 'enableDshInstall', 'npmRegistry', 'proxy', 'logPath', 'vivySourceInstall'] as const) {
+          for (const key of ['enableNpmInstall', 'enableGitInstall', 'enableDshInstall', 'npmRegistry', 'proxy', 'logPath', 'vivySourceInstall', 'vivySourceAutoCommit'] as const) {
             if (source[key] !== undefined) patch[key] = source[key]
           }
           // 日志位置：非空时预建目录验证可写，失败直接 400 拦截（默认位置永远合法，空串 = 回默认）
@@ -946,12 +946,36 @@ export function mountPluginHubRoutes(webServer: WebServerService, profile: strin
         const paths: Record<string, string> = {}
         const loaded: string[] = []
         const dshCapable: string[] = []
+        // Vivy 源码安装的插件：包名 → studio/ 下的源码相对路径（卸载确认弹窗提示将删除源码目录用）
+        const vivySourcePaths: Record<string, string> = {}
         for (const name of Object.keys(installed)) {
           paths[name] = join(profileDirectory(profile), 'node_modules', name)
           if (isEntryLoaded(loader, name)) loaded.push(name)
           if (isDshPlugin(profile, name)) dshCapable.push(name)
         }
-        sendJson(response, 200, { profile, installed, versions: readInstalledVersions(profile), paths, loaded, dshCapable })
+        {
+          const vivyRoot = resolveVivyRoot()
+          if (vivyRoot) {
+            const studioRoot = join(vivyRoot, 'studio')
+            for (const p of readVivySourceRegistry(profile).plugins) {
+              if (p.localPath) vivySourcePaths[p.name] = p.localPath.replace(/\\/g, '/')
+            }
+            // 回退：老安装 / 注册表缺失的 file: 依赖指向 studio/ 的条目也认作源码安装
+            for (const [name, spec] of Object.entries(installed)) {
+              if (vivySourcePaths[name] !== undefined) continue
+              if (spec.startsWith('file:')) {
+                try {
+                  const depPath = resolve(profileDirectory(profile), spec.slice(5))
+                  if (depPath.toLowerCase().startsWith(studioRoot.toLowerCase())) {
+                    const slug = depPath.slice(studioRoot.length).replace(/^[/\\]+/, '').replace(/\\/g, '/')
+                    if (slug) vivySourcePaths[name] = `studio/${slug}`
+                  }
+                } catch { /* 解析失败跳过 */ }
+              }
+            }
+          }
+        }
+        sendJson(response, 200, { profile, installed, versions: readInstalledVersions(profile), paths, loaded, dshCapable, vivySourcePaths })
       },
     }),
   ]

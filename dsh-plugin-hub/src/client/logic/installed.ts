@@ -48,6 +48,9 @@ export interface InstalledItem {
   /** 是否真正的 dsh 插件（包内声明 dsh 配置 / 在 profile bundles 清单）：
    *  非 dsh 插件（如 GitHub 官方示例仓库）装上也不会被宿主加载，不提示「待重启」 */
   dshCapable: boolean
+  /** Vivy 源码安装的源码相对路径（studio/<slug>）；非源码安装为 null。
+   *  非 null 时卸载会同时删除该源码目录，确认弹窗据此提示风险 */
+  vivySourcePath: string | null
 }
 
 /** 安装时记录的目录信号（按仓库小写 key 查表）。 */
@@ -192,6 +195,7 @@ export function installedItemsOf(
   paths: Record<string, string> | null,
   loadedNames: string[] | null,
   dshCapableNames: string[] | null,
+  vivySourcePaths: Record<string, string> | null,
 ): InstalledItem[] {
   const items: InstalledItem[] = []
   // 已被目录条目认领的依赖 key：同一依赖只归属一个目录条目（React key 必须唯一，
@@ -216,6 +220,7 @@ export function installedItemsOf(
       hasUpdate: hasUpdateOf(p, installed, versions),
       loaded: loadedNames?.includes(name) ?? false,
       dshCapable: dshCapableNames?.includes(name) ?? false,
+      vivySourcePath: vivySourcePaths?.[name] ?? null,
     })
   }
   // 自定义安装：依赖表里没被任何目录插件认领的条目（命令行安装的目录外插件）
@@ -240,6 +245,7 @@ export function installedItemsOf(
       hasUpdate: false,
       loaded: loadedNames?.includes(name) ?? false,
       dshCapable: dshCapableNames?.includes(name) ?? false,
+      vivySourcePath: vivySourcePaths?.[name] ?? null,
     })
   }
   return items

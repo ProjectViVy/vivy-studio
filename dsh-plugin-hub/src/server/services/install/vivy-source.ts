@@ -112,6 +112,7 @@ function runCommand(
   cwd: string,
   task?: InstallTask,
   timeoutMs = 5 * 60 * 1000,
+  useShell?: boolean,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean; error?: string }> {
   return new Promise((resolve) => {
     let stdout = ''
@@ -119,12 +120,14 @@ function runCommand(
     let timedOut = false
     let settled = false
     let child: ReturnType<typeof spawn>
-    const useShell = process.platform === 'win32'
+    // shell 由调用方决定：git 走原生 spawn（不经 cmd，保证带空格参数不被拆词），
+    // pnpm/npm/tar 这类 .cmd 包装在 Windows 上仍必须经 shell 解析
+    const useShellFinal = useShell ?? process.platform === 'win32'
 
     try {
       child = spawn(file, args, {
         cwd,
-        shell: useShell,
+        shell: useShellFinal,
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       })
@@ -174,6 +177,20 @@ function runCommand(
       finish({ exitCode: code, stdout, stderr, timedOut, error: timedOut ? 'timed out' : undefined })
     })
   })
+}
+
+/**
+ * git 专用 runner：原生 spawn（不经 shell）。Windows 上 git 是真实 .exe，
+ * 无需 cmd 解析；带空格的消息/路径参数若有 shell 会被拆词破坏（DEP0190），
+ * 这里固定 shell=false。
+ */
+function runGit(
+  args: string[],
+  cwd: string,
+  task?: InstallTask,
+  timeoutMs = 5 * 60 * 1000,
+): Promise<{ exitCode: number | null; stdout: string; stderr: string; timedOut: boolean; error?: string }> {
+  return runCommand('git', args, cwd, task, timeoutMs, false)
 }
 
 /** Ensure a directory exists for cloning. */
@@ -249,13 +266,13 @@ export async function cloneOrUpdateVivySourceRepo(
 
   if (existsSync(join(pluginDir, '.git'))) {
     // Check for dirty working tree
-    const status = await runCommand('git', ['status', '--porcelain'], pluginDir, task, 30_000)
+    const status = await runGit(['status', '--porcelain'], pluginDir, task, 30_000)
     if (status.exitCode !== 0) throw new Error(`git status failed in ${pluginDir}`)
     if (status.stdout.trim()) {
       throw new Error(`directory ${pluginDir} has local changes; commit or stash before update`)
     }
     pushTaskLine(task, `[vivy-source] updating ${repo} in ${pluginDir}`)
-    const pull = await runCommand('git', ['pull'], pluginDir, task)
+    const pull = await runGit(['pull'], pluginDir, task)
     if (pull.exitCode !== 0) throw new Error(`git pull failed for ${repo}`)
     return
   }
@@ -272,7 +289,7 @@ export async function cloneOrUpdateVivySourceRepo(
 
   ensureDir(dirname(pluginDir))
   pushTaskLine(task, `[vivy-source] cloning ${repo} into ${pluginDir}`)
-  const clone = await runCommand('git', ['clone', target, pluginDir], resolveVivyRoot() ?? pluginDir, task)
+  const clone = await runGit(['clone', target, pluginDir], resolveVivyRoot() ?? pluginDir, task)
   if (clone.exitCode !== 0) throw new Error(`git clone failed for ${repo}`)
 }
 
@@ -420,6 +437,18 @@ export async function installVivySourcePlugin(
     else registry.plugins.push(entry)
     writeVivySourceRegistry(profile, registry)
 
+    // 自动提交（设置开启时）：把新装/更新的源码目录提交进 vivy-studio 子模块，
+    // 保持源码树干净留痕；只提交该插件路径，不触碰其他改动
+    if (loadSettings(profile).vivySourceAutoCommit !== false) {
+      const sha = await commitVivySourceChange(
+        vivyRoot,
+        toUnixPath(join('studio', dirName)),
+        `chore(hub): install plugin ${manifest.name} source`,
+        task,
+      )
+      if (sha) pushTaskLine(task, `[vivy-source] committed install to vivy-studio repo (${sha})`)
+    }
+
     return { packageName: manifest.name, pluginDir, repo: repo ?? `npm:${pkg}`, needsRestart: true }
   } catch (error) {
     if (created && existsSync(pluginDir)) {
@@ -431,12 +460,16 @@ export async function installVivySourcePlugin(
   }
 }
 
-/** Remove a Vivy-source plugin from the profile. The source directory is kept. */
+/**
+ * Remove a Vivy-source plugin from the profile — deletion closure: the source
+ * directory under `studio/` is deleted too, and (when auto-commit is enabled)
+ * the removal is committed into the vivy-studio submodule.
+ */
 export async function removeVivySourcePlugin(
   profile: string,
   target: string,
   task?: InstallTask,
-): Promise<{ removed: boolean; packageName?: string }> {
+): Promise<{ removed: boolean; packageName?: string; sourceDeleted?: boolean; commitSha?: string | null }> {
   const registry = readVivySourceRegistry(profile)
   const repo = githubRepoOf(target)
 
@@ -452,8 +485,10 @@ export async function removeVivySourcePlugin(
   const bundles = (((profileManifest.dsh as Record<string, unknown> | undefined)?.profile as Record<string, unknown> | undefined)?.bundles as string[] | undefined) ?? []
 
   let packageName: string | undefined
+  let entryLocalPath: string | null = null
   if (entry) {
     packageName = entry.name
+    entryLocalPath = entry.localPath ?? null
   } else {
     // Try to find a dependency whose spec points into Vivy's studio directory
     const vivyRoot = resolveVivyRoot()
@@ -493,7 +528,32 @@ export async function removeVivySourcePlugin(
   registry.plugins = registry.plugins.filter((p) => p.name !== packageName)
   writeVivySourceRegistry(profile, registry)
 
-  return { removed: true, packageName }
+  // —— 卸载闭环：profile / 注册表移除成功后，删除 studio/ 下的源码目录 ——
+  // 放在持久化之后执行，避免半吊子状态（profile 已改但源码未删）
+  let sourceDeleted = false
+  let commitSha: string | null = null
+  const vivyRoot = resolveVivyRoot()
+  if (vivyRoot) {
+    const resolved = resolveVivySourceDir(profile, packageName, entryLocalPath)
+    if (resolved) {
+      sourceDeleted = await deleteVivySourcePluginDir(vivyRoot, resolved.rel, task)
+      if (sourceDeleted && loadSettings(profile).vivySourceAutoCommit !== false) {
+        commitSha = await commitVivySourceChange(
+          vivyRoot,
+          resolved.rel,
+          `chore(hub): remove plugin ${packageName} source`,
+          task,
+        )
+        if (commitSha) pushTaskLine(task, `[vivy-source] committed removal to vivy-studio repo (${commitSha})`)
+      }
+    } else {
+      pushTaskLine(task, `[vivy-source] cannot resolve source directory for ${packageName}; source kept`)
+    }
+  } else {
+    pushTaskLine(task, '[vivy-source] cannot locate Vivy repository root; source directory kept')
+  }
+
+  return { removed: true, packageName, sourceDeleted, commitSha }
 }
 
 /** Update a Vivy-source plugin: GitHub sources pull latest, npm sources re-download. */
@@ -530,12 +590,129 @@ export async function updateVivySourcePlugin(
   const pnpm = await runCommand('pnpm', ['install'], profileDirectory(profile), task)
   if (pnpm.exitCode !== 0) throw new Error('pnpm install failed after update')
 
+  if (loadSettings(profile).vivySourceAutoCommit !== false) {
+    const sha = await commitVivySourceChange(vivyRoot, toUnixPath(entry.localPath), `chore(hub): update plugin ${entry.name} source`, task)
+    if (sha) pushTaskLine(task, `[vivy-source] committed update to vivy-studio repo (${sha})`)
+  }
+
   return { packageName: entry.name, needsRestart: true }
 }
 
 /** List Vivy-source plugins currently registered in the profile. */
 export function listVivySourcePlugins(profile: string): VivySourcePlugin[] {
   return readVivySourceRegistry(profile).plugins
+}
+
+/**
+ * 卸载闭环：解析插件在 Vivy 源码树里的目录。
+ * 优先用注册表的 `localPath`；老安装/注册表缺失时回退扫 profile 依赖里
+ * `file:` 指向 studio/ 的条目。只认 studio/ 子模块工作树内的路径，其余返回 null。
+ * 返回 `{ dir, rel }`：dir 是绝对路径，rel 是相对 Vivy 仓库根的 `studio/<slug>` 形式。
+ */
+export function resolveVivySourceDir(
+  profile: string,
+  packageName: string,
+  entryLocalPath: string | null,
+): { dir: string; rel: string } | null {
+  const vivyRoot = resolveVivyRoot()
+  if (!vivyRoot) return null
+  const studioRoot = join(vivyRoot, 'studio')
+
+  if (entryLocalPath) {
+    const dir = resolve(vivyRoot, entryLocalPath)
+    if (dir.toLowerCase().startsWith(studioRoot.toLowerCase())) {
+      const slug = entryLocalPath.replace(/^studio[/\\]+/, '').replace(/[/\\]+/g, '/')
+      if (slug) return { dir, rel: `studio/${slug}` }
+    }
+  }
+
+  // 回退：注册表缺失（旧安装）时按依赖里的 file: spec 定位
+  try {
+    const profileManifest = readProfileManifest(profile)
+    const deps = (profileManifest.dependencies as Record<string, string> | undefined) ?? {}
+    const spec = deps[packageName]
+    if (typeof spec === 'string' && spec.startsWith('file:')) {
+      const depPath = resolve(profileDirectory(profile), spec.slice(5))
+      if (depPath.toLowerCase().startsWith(studioRoot.toLowerCase())) {
+        const slug = depPath.slice(studioRoot.length).replace(/^[/\\]+/, '').replace(/[/\\]+/g, '/')
+        if (slug) return { dir: depPath, rel: `studio/${slug}` }
+      }
+    }
+  } catch { /* 解析失败当作解析不到 */ }
+  return null
+}
+
+/**
+ * 自动提交：在 vivy-studio 子模块里把某条插件路径的改动提交掉。
+ * 路径限定（`-- <rel>`），绝不触碰子模块里的其他改动；不是 git 仓库、
+ * 无相关改动或提交失败时只记警告并返回 null —— 提交失败绝不能让安装/卸载失败。
+ * 返回提交的短 SHA（成功后）。
+ */
+export async function commitVivySourceChange(
+  vivyRoot: string,
+  repoRel: string,
+  message: string,
+  task?: InstallTask,
+): Promise<string | null> {
+  const submodule = join(vivyRoot, 'studio')
+  // git 在子模块根目录执行：rel 转成相对子模块的路径（去掉 `studio/` 前缀）
+  const rel = repoRel.replace(/^studio[/\\]+/, '').replace(/\\/g, '/')
+  if (!rel) return null
+
+  const probe = await runGit(['rev-parse', '--is-inside-work-tree'], submodule, task, 15_000)
+  if (probe.exitCode !== 0) {
+    pushTaskLine(task, `[vivy-source] studio/ is not a git work tree; skipped auto-commit (${rel})`)
+    return null
+  }
+  const add = await runGit(['add', '--', rel], submodule, task, 30_000)
+  if (add.exitCode !== 0) {
+    pushTaskLine(task, `[vivy-source] git add failed for ${rel}; skipped auto-commit: ${add.stderr.trim().split(/\r?\n/).slice(-2).join(' ')}`)
+    return null
+  }
+  // exit 0 = 该路径无暂存差异（无改动/从未跟踪且已不存在）→ 不产生空提交
+  const staged = await runGit(['diff', '--cached', '--quiet', '--', rel], submodule, task, 15_000)
+  if (staged.exitCode === 0) {
+    pushTaskLine(task, `[vivy-source] no tracked change for ${rel}; nothing to commit`)
+    return null
+  }
+  // 显式关掉 GPG 签名：无人值守环境里签名会挂起/失败，本提交只是本地留痕
+  const commit = await runGit(
+    ['-c', 'commit.gpgsign=false', 'commit', '-m', message],
+    submodule, task, 60_000,
+  )
+  if (commit.exitCode !== 0) {
+    pushTaskLine(task, `[vivy-source] auto-commit failed: ${commit.stderr.trim().split(/\r?\n/).slice(-3).join(' ')}`)
+    return null
+  }
+  const sha = await runGit(['rev-parse', '--short', 'HEAD'], submodule, task, 15_000)
+  return sha.exitCode === 0 ? sha.stdout.trim() : null
+}
+
+/** 删除 Vivy 源码目录（卸载闭环）：删掉 studio/<slug> 整棵目录。
+ *  克隆流程的目录自带嵌套 .git，存在未提交改动时先打警告行（改动随目录一并删除）。 */
+export async function deleteVivySourcePluginDir(
+  vivyRoot: string,
+  repoRel: string,
+  task?: InstallTask,
+): Promise<boolean> {
+  const dir = resolve(vivyRoot, repoRel)
+  if (!existsSync(dir)) {
+    pushTaskLine(task, `[vivy-source] source directory ${toUnixPath(dir)} not found; nothing to delete`)
+    return false
+  }
+  if (existsSync(join(dir, '.git'))) {
+    const status = await runGit(['status', '--porcelain'], dir, task, 15_000)
+    if (status.exitCode === 0 && status.stdout.trim()) {
+      pushTaskLine(task, `[vivy-source] warning: ${toUnixPath(dir)} has uncommitted changes; they are deleted together with the plugin source`)
+    }
+  }
+  pushTaskLine(task, `[vivy-source] deleting source directory ${toUnixPath(dir)}`)
+  try {
+    rmSync(dir, { recursive: true, force: true })
+  } catch (error) {
+    throw new Error(`failed to delete plugin source directory ${toUnixPath(dir)}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+  return true
 }
 
 function markTaskFailed(task: InstallTask | undefined, message: string): InstallResult {

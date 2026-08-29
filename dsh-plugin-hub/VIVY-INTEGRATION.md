@@ -151,7 +151,7 @@ pnpm install
 
 ## Vivy 源码安装模式（vivy-source-install）
 
-插件商城在 `vivy-studio` profile 下默认启用 **Vivy 源码安装**：把插件放进宿主挂载的 `studio/<plugin>/`（即 `vivy-studio` 子模块工作树），作为 `file:` bundle 注册进 Vivy Studio profile，而不是安装到系统 `DSH_HOME`。安装会弄脏子模块工作树；默认不要把安装噪声自动 commit 进 `vivy-studio` main。
+插件商城在 `vivy-studio` profile 下默认启用 **Vivy 源码安装**：把插件放进宿主挂载的 `studio/<plugin>/`（即 `vivy-studio` 子模块工作树），作为 `file:` bundle 注册进 Vivy Studio profile，而不是安装到系统 `DSH_HOME`。安装 / 更新 / 卸载会改动子模块工作树；`vivySourceAutoCommit`（默认开启）会自动把该插件路径的改动提交进 `vivy-studio` 仓库（路径限定，不碰其他改动），关闭后变更留待手动提交。
 
 ### 行为（双流程）
 
@@ -162,8 +162,9 @@ pnpm install
 
 两条流程共用后续：检查 `dsh.bundle` → 校验入口文件（缺失即失败回滚）→ 写入 profile `package.json`（`file:` 依赖 + bundle）→ `pnpm install` → 登记 `data/studio-home/profiles/vivy-studio/vivy-source-plugins.json`（GitHub 记 `owner/repo`，npm 记 `npm:<包名>`）。
 
-- **卸载**：从 profile `package.json` 与注册表移除，**保留** `studio/` 下的源码目录（避免误删本地改动）。
+- **卸载（闭环）**：从 profile `package.json` 与注册表移除，**同时删除 `studio/` 下的源码目录**（克隆流程的目录自带嵌套 `.git`，存在未提交改动时任务输出会先警告，改动随目录一并删除）。
 - **失败回滚**：新建目录在失败（无 bundle / 构建失败 / pnpm 失败）时自动删除，不在 `studio/` 留残留。
+- **自动提交**：设置 `vivySourceAutoCommit`（默认开启）时，安装 / 更新 / 卸载源码插件后自动把 `studio/` 下该插件路径的改动 `git commit` 进 `vivy-studio` 子模块 —— 只提交该插件路径，绝不触碰子模块里的其他改动；非 git 仓库 / 无相关改动 / 提交失败时只记警告，不阻断安装或卸载。关闭该开关则保持工作树原样（变更留待手动提交）。
 
 > 说明：本构建无「更新」按钮/检测；源码安装的插件要更新，直接进 `studio/<plugin>/` 改源码或 `git pull`，重启 Studio 生效。
 
@@ -175,11 +176,11 @@ pnpm install
 
 | 文件 | 作用 |
 |---|---|
-| `src/server/services/install/vivy-source.ts` | 克隆 / 构建 / 注册 / 卸载引擎 |
+| `src/server/services/install/vivy-source.ts` | 克隆 / 构建 / 注册 / 卸载引擎（卸载含源码目录删除 + 自动提交） |
 | `src/server/services/install/task-queue.ts` | 入队分支：vivy-studio 走源码路径 |
-| `src/server/http/routes.ts` | 安装路由：vivy 模式跳过 npm 反查与预检 |
-| `src/server/services/settings.ts` | `vivySourceInstall` 设置持久化 |
-| `src/client/components/views/SettingsView.tsx` | 设置开关 |
+| `src/server/http/routes.ts` | 安装路由：vivy 模式跳过 npm 反查与预检；`/installed` 返回 `vivySourcePaths` |
+| `src/server/services/settings.ts` | `vivySourceInstall` / `vivySourceAutoCommit` 设置持久化 |
+| `src/client/components/views/SettingsView.tsx` | 设置开关（源码安装 + 自动提交） |
 | `launch-vivy-studio.ps1` | 注入 `VIVY_ROOT` + 合并注册表（重启不丢插件） |
 
 ### 重启不丢失
