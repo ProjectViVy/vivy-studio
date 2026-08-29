@@ -12,7 +12,7 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { installCommandOf, repoFromInstallTarget } from '../src/client/logic/install-command.ts'
+import { repoFromInstallTarget } from '../src/client/logic/install-command.ts'
 import { normalize } from '../src/client/logic/normalize.ts'
 import { pluginIssueUrl } from '../src/client/logic/urls.ts'
 
@@ -55,12 +55,6 @@ test('pluginIssueUrl: 无尝试记录时正文不含该段落', () => {
   const url = pluginIssueUrl('owner/repo', 'error xyz')
   const body = decodeURIComponent(url.split('body=')[1])
   assert.ok(!body.includes('Attempted install channels'))
-})
-
-test('installCommandOf: GitHub source uses an explicit HTTPS URL', () => {
-  const p = normalize({ s: 'aegis', n: 'Aegis', r: 'ganyuanran/aegis' })
-  assert.equal(installCommandOf(p), 'dsh plugin add git+https://github.com/ganyuanran/aegis.git')
-  assert.equal(installCommandOf(p, true), 'dsh plugin --profile web add git+https://github.com/ganyuanran/aegis.git')
 })
 
 test('repoFromInstallTarget: keeps catalog identity across Git target formats', () => {

@@ -29,20 +29,19 @@ test('githubRepoOf: recognizes canonical and legacy GitHub targets', () => {
   assert.equal(githubRepoOf('https://example.com/owner/repo.git'), null)
 })
 
-test('installTargetOf: strips an official dsh plugin command down to its target', () => {
-  // 官方唯一形式：`dsh plugin --profile <name> <add|update> <target>`（--profile 必填、无 -p 简写）；
-  // 支持 --profile=<name> 等号形式；update 动词同样剥成裸目标（更新已安装目标到最新）；
-  // 非命令/非官方输入原样返回
+test('installTargetOf: strips an official dsh plugin add command down to its target', () => {
+  // 官方唯一形式：`dsh plugin --profile <name> add <target>`（--profile 必填、无 -p 简写）；
+  // 支持 --profile=<name> 等号形式；非命令/非官方输入原样返回
   assert.equal(installTargetOf('dsh plugin --profile web add github:dHR-P/dsh-safe-launch'), 'github:dHR-P/dsh-safe-launch')
   assert.equal(installTargetOf('dsh plugin --profile=web add github:dHR-P/dsh-safe-launch'), 'github:dHR-P/dsh-safe-launch')
   assert.equal(installTargetOf('DSH PLUGIN --profile web ADD https://github.com/owner/repo.git'), 'https://github.com/owner/repo.git')
-  assert.equal(installTargetOf('dsh plugin --profile web update dsh-plugin'), 'dsh-plugin')
-  assert.equal(installTargetOf('dsh plugin --profile=web UPDATE lodash'), 'lodash')
   // 官方 CLI 不认 -p 简写、--profile 不可省略：这类输入不再剥命令，原样返回
   assert.equal(installTargetOf('dsh plugin -p web add github:dHR-P/dsh-safe-launch'), 'dsh plugin -p web add github:dHR-P/dsh-safe-launch')
   assert.equal(installTargetOf('dsh plugin add lodash'), 'dsh plugin add lodash')
-  // 命令卡片不认 remove 动词（卸载由「已安装」列表的卸载按钮执行）：不剥命令，原样返回
+  // 命令卡片不认 remove/update 动词（卸载走「已安装」列表、本构建无升级路径）：不剥命令，原样返回
   assert.equal(installTargetOf('dsh plugin --profile web remove lodash'), 'dsh plugin --profile web remove lodash')
+  assert.equal(installTargetOf('dsh plugin --profile web update dsh-plugin'), 'dsh plugin --profile web update dsh-plugin')
+  assert.equal(installTargetOf('dsh plugin --profile=web UPDATE lodash'), 'dsh plugin --profile=web UPDATE lodash')
   assert.equal(installTargetOf('lodash'), 'lodash')
   assert.equal(installTargetOf('https://github.com/owner/repo.git'), 'https://github.com/owner/repo.git')
   assert.equal(installTargetOf(''), '')
