@@ -16,7 +16,6 @@ This tree is consumed there as a **git submodule** mounted at `studio/`.
 | `dsh-better-sidebar/` | Community plugin snapshot (source-install) |
 | `dsh-context/` | Community plugin snapshot |
 | `dsh-cost-meter/` | Community plugin snapshot |
-| `dsh-plugin-subscriptions/` | Community plugin snapshot |
 | `verify-st1.mjs` / `verify-st2.mjs` | Studio bootstrap checks |
 
 ## What does **not** live here
