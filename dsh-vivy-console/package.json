@@ -1,0 +1,30 @@
+{
+  "name": "dsh-vivy-console",
+  "version": "0.1.0",
+  "description": "Vivy Studio first-party console: 总控台 — one-click backend+frontend loop, separate Vivy Code TUI panel opener (not mixed into one-click), unified logs; plus 打包与版本 via vivy-studio.exe",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "license": "MIT"
+}
