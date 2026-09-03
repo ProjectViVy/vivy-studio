@@ -246,21 +246,25 @@ body::before {
   color: var(--vivy-ink);
 }
 
-/* Cover the official whale wordmark. Do not insert nodes into React trees. */
-svg[viewBox="0 0 182 24"] {
+/* Cover the official wordmark. DSH renders either the full mark or the
+   text-only variant; keep the selector compatible with both shapes. */
+svg[viewBox="0 0 182 24"],
+svg[viewBox="26 0 156 24"] {
   width: 0 !important;
   height: 0 !important;
   overflow: hidden !important;
   position: absolute !important;
 }
 
-button:has(> svg[viewBox="0 0 182 24"]) {
+button:has(svg[viewBox="0 0 182 24"]),
+button:has(svg[viewBox="26 0 156 24"]) {
   display: inline-flex !important;
   align-items: center !important;
   gap: 9px !important;
 }
 
-button:has(> svg[viewBox="0 0 182 24"])::before {
+button:has(svg[viewBox="0 0 182 24"])::before,
+button:has(svg[viewBox="26 0 156 24"])::before {
   content: "V";
   width: 22px;
   height: 22px;
@@ -275,7 +279,8 @@ button:has(> svg[viewBox="0 0 182 24"])::before {
   text-align: center;
 }
 
-button:has(> svg[viewBox="0 0 182 24"])::after {
+button:has(svg[viewBox="0 0 182 24"])::after,
+button:has(svg[viewBox="26 0 156 24"])::after {
   content: "Nierland";
   color: var(--dsw-alias-label-primary);
   font-family: var(--vivy-display);
