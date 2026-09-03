@@ -264,10 +264,12 @@ button:has(svg[viewBox="26 0 156 24"]) {
 }
 
 button:has(svg[viewBox="0 0 182 24"])::before,
-button:has(svg[viewBox="26 0 156 24"])::before {
+button:has(svg[viewBox="26 0 156 24"])::before,
+[class*="railMark"]::before {
   content: "V";
   width: 22px;
   height: 22px;
+  flex: none;
   border-radius: 2px;
   background: var(--vivy-fluorite);
   color: #fffaf3;
