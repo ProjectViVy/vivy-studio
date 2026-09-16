@@ -306,11 +306,16 @@ ellipse[fill="#6187D8"] {
   grid-template-columns: auto auto !important;
 }
 
-[class*="headlineText"] {
+/* Welcome slogan. Older shells expose a `headlineText` element; DSH >= 0.1.6
+   splits the hero into headline > titleGroup > (slogan span, preview badge),
+   so match both shapes and keep the badge out of the replacement. */
+[class*="headlineText"],
+[class*="headline"] > [class*="titleGroup"] > span:not([class*="previewBadge"]) {
   font-size: 0 !important;
 }
 
-[class*="headlineText"]::after {
+[class*="headlineText"]::after,
+[class*="headline"] > [class*="titleGroup"] > span:not([class*="previewBadge"])::after {
   content: "寻找真心之旅";
   font-family: var(--vivy-serif);
   font-size: 34px;

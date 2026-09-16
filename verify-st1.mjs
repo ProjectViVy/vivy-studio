@@ -20,7 +20,9 @@ const afterOf = async (sel) => page.locator(sel).first().evaluate(
 )
 
 const title = await page.title()
-const sloganAfter = await afterOf('[class*="headlineText"]')
+const sloganAfter = await afterOf(
+  '[class*="headline"] > [class*="titleGroup"] > span:not([class*="previewBadge"])',
+)
 const wordmarkAfter = await afterOf('button:has(> svg[viewBox="0 0 182 24"])')
 const welcomeEl = page.locator('[class*="copy"] p').first()
 const welcomeAfter = (await welcomeEl.count()) > 0 ? await afterOf('[class*="copy"] p') : "(already acknowledged)"
