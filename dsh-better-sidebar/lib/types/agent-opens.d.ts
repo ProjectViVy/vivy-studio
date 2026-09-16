@@ -54,9 +54,12 @@ export declare class AgentOpenRegistry {
  * own routes do.
  * @param ctx - host plugin context (carries the tools service).
  * @param registry - the open-request registry (per-session queue + views).
- * @param resolveCwd - live cwd resolver for one session id.
+ * @param resolveCwd - async cwd resolver for one session id. Resolves through
+ *  the session header, the client-supplied cwd, and the persistence index
+ *  before falling back to the host process cwd (production always provides
+ *  persistence, so the fallback is reached only in tests / stripped-down hosts).
  * @param readPrefs - live resolved side card prefs (for tab enable gates).
  * @returns a disposer that unregisters the tool.
  */
-export declare function registerOpenTool(ctx: Context, registry: AgentOpenRegistry, resolveCwd: (sessionId: string) => string, readPrefs: () => SidebarPrefs): () => void;
+export declare function registerOpenTool(ctx: Context, registry: AgentOpenRegistry, resolveCwd: (sessionId: string) => Promise<string>, readPrefs: () => SidebarPrefs): () => void;
 export {};

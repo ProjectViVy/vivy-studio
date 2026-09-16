@@ -26,6 +26,11 @@ export interface TabContentMemoKey {
     revealed: string[];
     localeRevision: string;
     tabsVersion: number;
+    /** When the tab is a pinned virtual tab (injected from another session),
+     *  this overrides `tab.id` passed to the tab descriptor's component so
+     *  TerminalView connects to the home session's PTY by the original id.
+     *  Undefined for regular tabs (no override). */
+    effectiveTabId: string | undefined;
 }
 /** True when the cell may skip a re-render (all render-affecting fields
  *  unchanged). Callback/context identities are deliberately ignored: their

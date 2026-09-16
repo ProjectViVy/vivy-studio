@@ -1,10 +1,14 @@
 import type { OpenWithTarget } from './open-with.ts';
+import type { BetterSidebarService } from './service.ts';
+import type { SidebarStore } from './state.ts';
 import { type UploadItem } from './upload.ts';
 /** Root label: the last path segment (mirror of the host rootLabel). */
 export declare function baseName(path: string): string;
 export declare function FileTree(props: {
     sessionId: string;
     cwd: string | undefined;
+    /** The sidebar store: the fence-refusal notice writes the `workspaceFence` pref through it. */
+    store: SidebarStore;
     expanded: string[];
     /** Files highlighted by a "Show in folder" reveal (absolute paths). */
     revealed: string[];
@@ -27,12 +31,22 @@ export declare function FileTree(props: {
     onOpenWith?: (targetId: string, path: string) => void;
     /** Toggle one target's pinned state (the submenu row's pushpin). */
     onToggleOpenWithPin?: (targetId: string) => void;
-    /** Insert `@<relative path>` into the composer draft. */
-    onReferenceFile: (path: string) => void;
+    /** Insert `@<relative path>` into the composer draft (file vs directory). */
+    onReferenceFile: (path: string, isDir: boolean) => void;
+    /** A rename landed (old row path → new path): the caller retargets open tabs. */
+    onPathRenamed?: (oldPath: string, newPath: string) => void;
+    /** A delete landed: the caller closes tabs at or under the removed path. */
+    onPathDeleted?: (path: string, isDir: boolean) => void;
     /** Bump to wipe the level cache and reload the visible set. */
     refreshTick: number;
     /** Upload into `dir` (absolute, inside the workspace); runs in the caller. */
     onUploadRequest: (dir: string, items: UploadItem[]) => void;
     /** True while an upload is in flight (drops are ignored). */
     busy: boolean;
+    /**
+     * The sidebar registry service: when present, externally registered file
+     * icons (`registerFileIcon`) outrank the host's file-type artwork on file rows.
+     * Absent → the built-ins alone (the host always passes it today).
+     */
+    service?: BetterSidebarService;
 }): import("react").JSX.Element;

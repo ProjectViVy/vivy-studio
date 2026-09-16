@@ -5,7 +5,7 @@
  * 响应解析器。解析器为纯函数(可单测);网络与凭据解析在宿主侧(index.js)。
  *
  * 归一化输出:windows = { [name]: { percent: 0-100, resetsAt: ISO 字符串 } }。
- * 凭证安全:每个 adapter 的 URL 均为硬编码官方域名,Key 永不发往其它域。
+ * 凭证安全:默认使用官方域名；MiniMax 可显式指定 HTTPS origin，仅向该 origin 发 Key，拒绝重定向。
  *
  * 实测确认(2026-08):
  *  - Anthropic OAuth usage 端点存活(未授权返回限流/401);
@@ -31,7 +31,7 @@
 
 import { createHash, createHmac } from 'node:crypto'
 
-import { fetchWithRetry } from './net.js'
+import { fetchWithRetry, readJsonBounded } from './net.js'
 
 export const CODING_PLAN_PROVIDERS = {
   anthropic: {
@@ -88,6 +88,12 @@ export const CODING_PLAN_PROVIDERS = {
     credentialEnvs: ['VOLC_ACCESSKEY', 'VOLCENGINE_ACCESS_KEY_ID', 'VOLCENGINE_ACCESS_KEY', 'ARK_ACCESS_KEY_ID'],
     credentialEnvsSecret: ['VOLC_SECRETKEY', 'VOLCENGINE_SECRET_ACCESS_KEY', 'VOLCENGINE_SECRET_KEY', 'ARK_SECRET_ACCESS_KEY'],
     keyHint: '火山引擎访问密钥 AccessKeyID + SecretAccessKey(控制台 IAM→用户→密钥,需 ArkReadOnlyAccess + BillingCenterReadOnlyAccess;或导出 VOLC_ACCESSKEY / VOLC_SECRETKEY)',
+  },
+  qwen: {
+    label: '千问 Qwen Token Plan',
+    credentialEnvs: [],
+    // 本地估算保持默认；可选择已登录的官方 qianwen CLI 查询订阅快照(#146)。
+    keyHint: '本地估算无需凭据；官方 CLI 模式需在 DSH 主机运行 qianwen auth login',
   },
 }
 
@@ -513,9 +519,12 @@ export const VOLCENGINE_SERVICE = 'ark'
 export const VOLCENGINE_REGION = 'cn-beijing'
 export const VOLCENGINE_VERSION = '2024-01-01'
 // 管控面 Action 白名单(按序尝试;需 AK/SK+HMAC 签名,非 Bearer)。
-// 实测(issue #60 评论 by @sanqiPanax, v1.5.46):GetAFPUsage 无参即可返回 5h/weekly/monthly+daily 三窗,而 GetUsageDetails 裸调 400(缺 Filter.StartTime),
-// GetPersonalPlan 亦需额外参数;为减少一次 400 探测,优先 GetAFPUsage。
-export const VOLCENGINE_ACTIONS = ['GetAFPUsage', 'GetUsageDetails', 'GetPersonalPlan']
+// GetCodingPlanUsage 为 CodingPlan 官方用量接口(issue #71 实测 by @suyukun):
+// 无参即可返回 Result.QuotaUsage[] 三窗(session/weekly/monthly,只含 Percent),
+// 置于首位;GetAFPUsage 实为 AgentPlan 接口(issue #60 评论 by @sanqiPanax,
+// v1.5.46),CodingPlan 用户拿到全 0/空,GetUsageDetails 裸调 400(缺
+// Filter.StartTime),GetPersonalPlan 亦需额外参数,保留作兜底变体。
+export const VOLCENGINE_ACTIONS = ['GetCodingPlanUsage', 'GetAFPUsage', 'GetUsageDetails', 'GetPersonalPlan']
 
 function hmacSha256(key, data) {
   return createHmac('sha256', key).update(data, 'utf8').digest()
@@ -588,8 +597,9 @@ function normalizeVolcWindowName(raw) {
 }
 
 /**
- * 解析火山方舟用量响应(管控面 GetUsageDetails / GetAFPUsage / GetPersonalPlan 等)。
- * 形似 { ResponseMetadata:..., Result: { UsageDetails:[{QuotaType,Total,Used,Remaining,ResetTime}], ... } }
+ * 解析火山方舟用量响应(管控面 GetCodingPlanUsage / GetUsageDetails / GetAFPUsage / GetPersonalPlan 等)。
+ * CodingPlan 官方形态 { Result: { QuotaUsage:[{Level:'session'|'weekly'|'monthly', Percent, ResetTimestamp, Cap}], ... } }(issue #71,
+ * 只返 Percent,无 used/total);或 { ResponseMetadata:..., Result: { UsageDetails:[{QuotaType,Total,Used,Remaining,ResetTime}], ... } }
  * 或 arkcli usage plan 的 { items:[{product:"coding-plan",periods:[{label:"session"/"weekly"/"monthly",percent,reset_at}]}] }
  * 或扁平窗口对象 { fiveHour:{used,limit,reset}, weekly:{...}, monthly:{...} }。
  * 容忍多种字段命名与大小写,百分比由 used/total 推导(或直接取 percent),非法窗口忽略。
@@ -640,7 +650,7 @@ export function parseVolcengineUsage(data) {
   // 尝试定位配额数组字段
   let quotaList = null
   if (root !== null && typeof root === 'object') {
-    quotaList = root.UsageDetails ?? root.usageDetails ?? root.usages ?? root.limits ?? root.quotas ?? root.windows ?? root.periods ?? root.details ?? root.items ?? null
+    quotaList = root.QuotaUsage ?? root.quotaUsage ?? root.UsageDetails ?? root.usageDetails ?? root.usages ?? root.limits ?? root.quotas ?? root.windows ?? root.periods ?? root.details ?? root.items ?? null
     if (!Array.isArray(quotaList) && Array.isArray(root)) quotaList = root
     // 单个Result包装对象里可能直接含窗口字段
     if (quotaList === null && typeof root === 'object' && !Array.isArray(root)) {
@@ -660,7 +670,9 @@ export function parseVolcengineUsage(data) {
     const windows = {}
     for (const entry of quotaList) {
       if (entry === null || typeof entry !== 'object') continue
-      const nameRaw = entry.QuotaType ?? entry.quotaType ?? entry.Type ?? entry.type ?? entry.Label ?? entry.label ?? entry.Period ?? entry.period ?? entry.Name ?? entry.name ?? entry.Window ?? entry.window ?? entry.QuotaName ?? entry.quotaName
+      // GetCodingPlanUsage 的窗口名字段为 Level(session/weekly/monthly,issue #71),
+      // 置于候选最前;其余 Action 沿用 QuotaType 等既有字段。
+      const nameRaw = entry.Level ?? entry.level ?? entry.QuotaType ?? entry.quotaType ?? entry.Type ?? entry.type ?? entry.Label ?? entry.label ?? entry.Period ?? entry.period ?? entry.Name ?? entry.name ?? entry.Window ?? entry.window ?? entry.QuotaName ?? entry.quotaName
       let name = normalizeVolcWindowName(nameRaw)
       if (name === null) continue
       let pct = null
@@ -815,12 +827,20 @@ export function scnetPlanPeriod(nowMs, planStart) {
   return { fromKey: keyOf(start), toKeyInclusive: keyOf(last), resetsAt: last.toISOString() }
 }
 
+export const SCNET_TOKEN_PLAN_PROVIDER_IDS = ['scnet', 'scnet-tokenplan', 'scnet-token-plan']
+
+export function isScnetTokenPlanProvider(provider) {
+  const name = String(provider ?? '').trim().toLowerCase().replace(/^llm-/, '')
+  return SCNET_TOKEN_PLAN_PROVIDER_IDS.includes(name)
+}
+
 /**
- * 汇总本地账本当前计费周期的 SCNet Credits 用量(按模型名匹配抵扣表;跨 provider 归并,
- * 未匹配模型不计)。entry 为 codingPlans.scnet 配置(planCredits 必填、planStart 可选)。
+ * 汇总本地账本当前计费周期的 SCNet Credits 用量，仅计 SCNet 订阅渠道的收录模型。
+ * entry 为 codingPlans.scnet 配置(planCredits 必填、planStart 可选)。
+ * includeCall 进一步应用用户显式的 Plan/API 分类。
  * 返回 null(planCredits 非法)或 { used, total, percent, resetsAt, byModel, windows }。
  */
-export function scnetTokenPlanWindows(days, entry, nowMs) {
+export function scnetTokenPlanWindows(days, entry, nowMs, includeCall) {
   const total = Number(entry?.planCredits)
   if (!Number.isFinite(total) || total <= 0) return null
   const period = scnetPlanPeriod(nowMs, entry?.planStart)
@@ -829,7 +849,10 @@ export function scnetTokenPlanWindows(days, entry, nowMs) {
   for (const [date, day] of Object.entries(days ?? {})) {
     if (typeof date !== 'string' || date < period.fromKey || date > period.toKeyInclusive) continue
     for (const [pmKey, buckets] of Object.entries(day?.byProviderModel ?? {})) {
-      const model = pmKey.includes(':') ? pmKey.slice(pmKey.indexOf(':') + 1) : pmKey
+      const sep = pmKey.indexOf(':')
+      const provider = sep > 0 ? pmKey.slice(0, sep) : ''
+      const model = sep > 0 ? pmKey.slice(sep + 1) : pmKey
+      if (!isScnetTokenPlanProvider(provider) || (includeCall && !includeCall(provider, model))) continue
       const canon = scnetCanonModelId(model)
       const rate = SCNET_RATE_BY_CANON[canon]
       if (rate === undefined || buckets === null || typeof buckets !== 'object') continue
@@ -853,7 +876,91 @@ export function scnetTokenPlanWindows(days, entry, nowMs) {
   }
 }
 
-/** 各家固定官方端点(硬编码白名单;region 变体按序尝试)。 */
+/**
+ * 千问 Token Plan(个人版)Credits 抵扣率(issue #78)。
+ *
+ * 平台未提供 API-Key 化的额度查询端点(额度仅控制台可见,需 cookie+sec_token
+ * 网关会话),与 SCNet 同模式走本地账本估算。抵扣率取自平台定价页
+ * (platform.qianwenai.com,单位:每百万 token 抵扣的 Credits;个人版为 Credits
+ * 计费,5 小时 + 7 天滚动窗口,本表按官方页 2026-08 数值内置,可在设置中覆盖)。
+ * cachedInput 为缓存读抵扣率;cacheWrite 计入未命中输入。
+ */
+export const QWEN_CREDIT_RATES = {
+  'qwen3.8-max-preview': { input: 60, cachedInput: 6, output: 60 },
+  'qwen3.7-max': { input: 60, cachedInput: 6, output: 60 },
+  'qwen3.7-plus': { input: 15, cachedInput: 1.5, output: 60 },
+  'qwen3.6-flash': { input: 3, cachedInput: 0.3, output: 12 },
+  'glm-5.2': { input: 45, cachedInput: 4.5, output: 120 },
+  'deepseek-v4-pro': { input: 45, cachedInput: 4.5, output: 90 },
+  'deepseek-v4-flash': { input: 3, cachedInput: 0.3, output: 12 },
+  'kimi-k2.7-code': { input: 30, cachedInput: 3, output: 60 },
+  'kimi-k2.6': { input: 30, cachedInput: 3, output: 60 },
+  'minimax-m2.5': { input: 30, cachedInput: 3, output: 60 },
+}
+
+const QWEN_CREDIT_RATES_BY_CANON = Object.fromEntries(
+  Object.entries(QWEN_CREDIT_RATES).map(([id, rate]) => [scnetCanonModelId(id), rate]),
+)
+
+// 只识别明确的订阅渠道；qianwen/dashscope 等按量渠道不能仅凭同名模型归入。
+export const QWEN_TOKEN_PLAN_PROVIDER_IDS = ['qwen', 'qwen-tokenplan', 'qianwen-tokenplan', 'qwen-token-plan', 'qianwen-token-plan']
+
+export function isQwenTokenPlanProvider(provider) {
+  const name = String(provider ?? '').trim().toLowerCase().replace(/^llm-/, '')
+  return QWEN_TOKEN_PLAN_PROVIDER_IDS.includes(name)
+}
+
+/**
+ * 汇总本地账本当前计费周期(自然月,与 SCNet 同款 scnetPlanPeriod)的千问
+ * Credits 用量。entry 为 codingPlans.qwen 配置:{ planCredits(必填,月度总额),
+ * planStart(可选,计费周期锚日), rates(可选,模型名 → 抵扣率覆盖,键为归一模型名) }。
+ * 仅汇总千问订阅 provider；includeCall 可进一步按 Plan/API 显式配置排除调用。
+ * 返回 null(planCredits 非法)或 { used, total, percent, resetsAt, byModel, windows }。
+ */
+export function qwenTokenPlanWindows(days, entry, nowMs, includeCall) {
+  const total = Number(entry?.planCredits)
+  if (!Number.isFinite(total) || total <= 0) return null
+  // 用户覆盖的抵扣率优先,内置表兜底;键与模型名均做字母数字归一比较。
+  const rawOverrides = entry?.rates !== null && typeof entry?.rates === 'object' && !Array.isArray(entry?.rates) ? entry.rates : {}
+  const overrides = Object.fromEntries(Object.entries(rawOverrides).map(([model, rate]) => [scnetCanonModelId(model), rate]))
+  const rateOf = canon => {
+    if (overrides[canon] !== undefined && overrides[canon] !== null && typeof overrides[canon] === 'object') return overrides[canon]
+    return QWEN_CREDIT_RATES_BY_CANON[canon]
+  }
+  const period = scnetPlanPeriod(nowMs, entry?.planStart)
+  const byModel = {}
+  let used = 0
+  for (const [date, day] of Object.entries(days ?? {})) {
+    if (typeof date !== 'string' || date < period.fromKey || date > period.toKeyInclusive) continue
+    for (const [pmKey, buckets] of Object.entries(day?.byProviderModel ?? {})) {
+      const sep = pmKey.indexOf(':')
+      const provider = sep > 0 ? pmKey.slice(0, sep) : ''
+      const model = sep > 0 ? pmKey.slice(sep + 1) : pmKey
+      if (!isQwenTokenPlanProvider(provider) || (includeCall && !includeCall(provider, model))) continue
+      const canon = scnetCanonModelId(model)
+      const rate = rateOf(canon)
+      if (rate === undefined || buckets === null || typeof buckets !== 'object') continue
+      const credits = scnetModelCredits(buckets, rate)
+      used += credits
+      byModel[canon] = (byModel[canon] ?? 0) + credits
+    }
+  }
+  const percent = Math.min(100, Math.round((used / total) * 1000) / 10)
+  const fmt = n => Math.round(n).toLocaleString('en-US')
+  return {
+    used,
+    total,
+    percent,
+    resetsAt: period.resetsAt,
+    byModel,
+    windows: {
+      monthly: { percent, resetsAt: period.resetsAt },
+      credits: { resetsAt: '', text: `${fmt(used)} / ${fmt(total)} Credits (est.)` },
+    },
+  }
+}
+
+/** 默认官方端点；MiniMax 可用显式 HTTPS origin 覆盖此列表。 */
 export const CODING_PLAN_ENDPOINTS = {
   anthropic: ['https://api.anthropic.com/api/oauth/usage'],
   zai: [
@@ -868,8 +975,10 @@ export const CODING_PLAN_ENDPOINTS = {
     'https://open.bigmodel.cn/api/coding/paas/v4/dashboard/billing/coding_plan/usage',
   ],
   minimax: [
-    'https://www.minimaxi.com/v1/token_plan/remains',
+    'https://www.minimax.cn/v1/token_plan/remains',
     'https://www.minimax.io/v1/token_plan/remains',
+    'https://www.minimaxi.com/v1/token_plan/remains',
+    'https://www.minimax.cn/v1/api/openplatform/coding_plan/remains',
     'https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains',
   ],
   kimi: [
@@ -885,6 +994,8 @@ export const CODING_PLAN_ENDPOINTS = {
   commandcode: ['https://api.commandcode.ai/alpha/billing/credits'],
   // SCNet 无 API-Key 化额度端点:本地 Credits 计量(见 scnetTokenPlanWindows),不走网络。
   scnet: [],
+  // 千问由本地估算或 qwen-cli.js 调用官方 CLI；插件不托管 CLI 登录凭据。
+  qwen: [],
   // 火山方舟:管控面 OpenAPI(需 AK/SK+HMAC,非 Bearer),按 Action 变体尝试(见 VOLCENGINE_ACTIONS)
   volcengine: VOLCENGINE_ACTIONS.map(action => `https://${VOLCENGINE_HOST}/?Action=${action}&Version=${VOLCENGINE_VERSION}`),
 }
@@ -898,6 +1009,26 @@ const CODING_PLAN_PARSERS = {
   siliconflow: parseSiliconFlowInfo,
   commandcode: parseCommandCodeCredits,
   volcengine: parseVolcengineUsage,
+}
+
+/** 空串为自动选择；自定义地址只接受 HTTPS origin，避免路径、凭据和重定向改变 Key 的目的地。 */
+export function normalizeMiniMaxBaseUrl(value) {
+  if (value === undefined || value === '') return ''
+  if (typeof value !== 'string' || value.length > 2048) return null
+  const text = value.trim()
+  if (!text) return ''
+  if (!/^https:\/\/[^/?#]+\/?$/i.test(text) || /[\s\\@?#]/.test(text)) return null
+  try {
+    const url = new URL(text)
+    if (!url.hostname || url.username || url.password || url.pathname !== '/') return null
+    return url.origin
+  } catch { return null }
+}
+
+export function miniMaxEndpoints(baseUrl) {
+  const origin = normalizeMiniMaxBaseUrl(baseUrl)
+  if (origin === null) throw new Error('MiniMax: invalid HTTPS origin')
+  return origin ? ['/v1/token_plan/remains', '/v1/api/openplatform/coding_plan/remains'].map(path => origin + path) : CODING_PLAN_ENDPOINTS.minimax
 }
 
 /**
@@ -948,9 +1079,10 @@ export function normalizeVolcengineKey(key) {
  * @param key - 已解析出的 API Key / OAuth token;火山方舟可为 { accessKeyId, secretAccessKey } 或 "AK:SK" 字符串;null 表示未找到。
  * @param locale - 消息语言(zh/en)。
  * @param t - 服务端文案函数 tmsg(locale, code, vars)。
+ * @param options - MiniMax 可指定 baseUrl 和取消 signal；留空保留官方回退链。
  * @returns {Promise<{ windows: object, endpoint: string }>}
  */
-export async function queryCodingPlan(provider, key, locale, t) {
+export async function queryCodingPlan(provider, key, locale, t, { baseUrl, signal } = {}) {
   const meta = CODING_PLAN_PROVIDERS[provider]
   if (meta === undefined) throw new Error(t(locale, 'codingPlanUnknown', { provider: String(provider) }))
   // 火山方舟:双凭据 AK/SK + HMAC 签名(非 Bearer),单独校验
@@ -1037,13 +1169,14 @@ export async function queryCodingPlan(provider, key, locale, t) {
     error.soft = true
     throw error
   }
-  const urls = CODING_PLAN_ENDPOINTS[provider]
+  const urls = provider === 'minimax' ? miniMaxEndpoints(baseUrl) : CODING_PLAN_ENDPOINTS[provider]
   let lastError = null
   // 200 但解析失败的「结构化错误」(业务信封 / 结构已变):比后续端点的 404 等传输层
   // 错误更有诊断价值,单独保留且最终优先抛出——否则最后端点的 404 会盖住 monitor
   // 端点解析失败的真实原因(issue #44 的误导性报错即由此而来)。
   let parseError = null
   for (const url of urls) {
+    signal?.throwIfAborted()
     // kimi 双端点形态(issue #53):api.kimi.com 为订阅配额(专用 UA + 解析器),
     // api.moonshot.cn 为 PAYG 余额;订阅端点 401 视为「无订阅 Key」继续降级尝试。
     let isKimiCoding = false
@@ -1067,7 +1200,7 @@ export async function queryCodingPlan(provider, key, locale, t) {
       }
       // 瞬时网络错误先在单端点上重试(issue #28 同一封装;attempts=2 控制多端点
       // 回退链的最坏串行耗时),仍失败再换端点变体。
-      response = await fetchWithRetry(url, { headers }, { timeoutMs: 15000, attempts: 2 })
+      response = await fetchWithRetry(url, { headers, ...(provider === 'minimax' ? { redirect: 'error', signal } : {}) }, { timeoutMs: 15000, attempts: 2 })
     } catch (error) {
       lastError = error
       continue // 网络错误:尝试下一个端点变体
@@ -1089,7 +1222,7 @@ export async function queryCodingPlan(provider, key, locale, t) {
       continue
     }
     let data
-    try { data = await response.json() } catch { data = null }
+    try { data = provider === 'minimax' ? await readJsonBounded(response) : await response.json() } catch { data = null }
     if (data === null || typeof data !== 'object') {
       // 200 但响应体非 JSON(如网关/CDN 的 HTML 拦截页):视为当前端点失败,
       // 继续尝试下一端点,不让 SyntaxError 中断整条多端点回退链。

@@ -12,19 +12,106 @@ import {
   DEFAULT_PEAK_EFFECTIVE_AT,
   DEFAULT_PEAK_WINDOWS,
   DEFAULT_PRICE_TABLE,
+  DEFAULT_PRICE_TABLE_CNY,
   DEFAULT_PROVIDER_PRICE_TABLE,
   costOf,
   normalizePrice,
   priceEntryFor,
   providerPriceEntryFor,
   usdFromCost,
+  isWrapperProviderId,
+  wrapperUpstreamProvider,
+  isLocalOriginProviderOrModel,
 } from './pricing.js'
-import { CODING_PLAN_PROVIDER_IDS } from './coding-plans.js'
+import { CODING_PLAN_PROVIDER_IDS, normalizeMiniMaxBaseUrl } from './coding-plans.js'
 import { DEFAULT_PLAN_PROVIDER_CLASS, PLAN_PROVIDER_IDS, billingClassOf, enabledPlanSetOf, planProviderIdOf, appendHourBucket, pruneHourBuckets, convertRecentCallsToBuckets, isRoutedThirdPartyCall } from './plan-billing.js'
 
 const LEDGER_VERSION = 1
 const MAX_SESSIONS_PER_DAY = 200
 const DEFAULT_HISTORY_DAYS = 180
+const GATEWAY_PROVIDER_IDS = ['antigravity', 'claude', 'codex', 'kimi', 'xai', 'workbuddy']
+const GATEWAY_DISPLAY_VALUES = ['sidebar', 'settings', 'both', 'off']
+const GATEWAY_SOURCE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/
+const GATEWAY_SECRET_KEYS = ['managementKey', 'apiKey', 'key', 'token', 'accessToken', 'oauthToken', 'secret', 'secretKey', 'password']
+
+function canonicalGatewayProviderForStore(value) {
+  const provider = typeof value === 'string' ? value.trim().toLowerCase() : value
+  return provider === 'anthropic' ? 'claude' : provider
+}
+
+function gatewayPortIsValid(port) {
+  if (port === undefined) return true
+  const number = Number(port)
+  return /^\d{1,5}$/.test(port) && number >= 1 && number <= 65535
+}
+
+/** Exact host[:port] allowlist entry; wildcards, paths, credentials and bare IPv6 are rejected. */
+function gatewayAllowedHostIsValid(raw) {
+  if (typeof raw !== 'string') return false
+  const value = raw.trim().toLowerCase()
+  if (value.length === 0 || value !== raw.trim() || /[\s/?#@\\]/.test(value)) return false
+  if (value.startsWith('[')) {
+    const close = value.indexOf(']')
+    if (close < 0) return false
+    const host = value.slice(1, close)
+    const port = value.slice(close + 1)
+    if (!host.includes(':') || !/^[0-9a-f:.]+$/.test(host)) return false
+    return port === '' || (port.startsWith(':') && gatewayPortIsValid(port.slice(1)))
+  }
+  const portMatch = value.match(/^(.*?)(?::(\d{1,5}))?$/)
+  if (portMatch === null || !gatewayPortIsValid(portMatch[2])) return false
+  const host = portMatch[1]
+  const octets = host.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/)
+  if (octets !== null) return octets.slice(1).every(part => Number(part) >= 0 && Number(part) <= 255)
+  return /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?))*$/.test(host)
+}
+
+function stripGatewaySourceSecrets(source) {
+  if (source === null || typeof source !== 'object' || Array.isArray(source)) return source
+  const copy = { ...source }
+  for (const key of GATEWAY_SECRET_KEYS) delete copy[key]
+  return copy
+}
+
+function normalizeGatewaySourceForStore(raw, fallback = {}) {
+  const source = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  const id = typeof source.id === 'string' ? source.id.trim() : (typeof fallback.id === 'string' ? fallback.id : '')
+  const providers = Array.isArray(source.includeProviders)
+    ? [...new Set(source.includeProviders.filter(value => typeof value === 'string').map(value => canonicalGatewayProviderForStore(value)).filter(value => GATEWAY_PROVIDER_IDS.includes(value)))]
+    : GATEWAY_PROVIDER_IDS.slice()
+  const hosts = Array.isArray(source.allowedHosts)
+    ? [...new Set(source.allowedHosts.filter(value => gatewayAllowedHostIsValid(value)).map(value => value.trim().toLowerCase()))].slice(0, 16)
+    : []
+  const refresh = Number(source.refreshMinutes)
+  return {
+    id,
+    type: typeof source.type === 'string' ? source.type : 'cliproxyapi',
+    label: typeof source.label === 'string' ? source.label.slice(0, 80) : (typeof fallback.label === 'string' ? fallback.label : id),
+    baseURL: typeof source.baseURL === 'string' ? source.baseURL.trim().replace(/\/+$/, '') : '',
+    enabled: source.enabled !== false,
+    display: GATEWAY_DISPLAY_VALUES.includes(source.display) ? source.display : 'both',
+    refreshMinutes: Number.isInteger(refresh) ? Math.min(1440, Math.max(1, refresh)) : 15,
+    includeProviders: providers.length > 0 ? providers : GATEWAY_PROVIDER_IDS.slice(),
+    allowedHosts: hosts,
+    allowInsecureHttp: source.allowInsecureHttp === true,
+    antigravityOnlyGemini: source.antigravityOnlyGemini === true,
+  }
+}
+
+function gatewayOriginIsValid(value) {
+  try {
+    const url = new URL(value)
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password
+      && !url.search && !url.hash && url.pathname === '/'
+  } catch { return false }
+}
+
+function gatewayHostIsLoopback(value) {
+  try {
+    const host = new URL(value).hostname.toLowerCase()
+    return host === 'localhost' || host === '::1' || /^127(?:\.\d{1,3}){3}$/.test(host)
+  } catch { return false }
+}
 
 /** 默认配置(首次启动;之后持久化副本优先)。 */
 export function defaultConfig() {
@@ -50,9 +137,16 @@ export function defaultConfig() {
     hideOfficialBalance: false, // 隐藏官方账户余额(issue #45):开启后侧边栏/会话页/设置页的官方余额 UI 整体不渲染
     hideTodayCost: false, // 隐藏今日消耗金额(issue #46):开启后侧栏今日费用行/预算明细今日行/概览今日卡片不渲染
     showTotalWithPlan: false, // 「含 Plan 总额」全局开关(v1.6.0):开启后全部金额展示按总等值(cost)计;默认按真金白银(apiCost)
+    includeSubagentCost: false, // 本会话展示可合并连续子代理后代;不重复写入每日账本。
+    codexQuotaEnabled: false, // Codex 额度按需开启,避免未使用 Codex 时显示卡片或查询。
+    sidebarSimple: false,
+    sidebarSimplePromptSeen: false,
+    sidebarModels: { enabled: false, period: 'today', topN: 5, summary: 'total', position: 'last', defaultOpen: false, remember: true, tokens: false, shares: true, refreshSeconds: 60, dock: false },
+    sidebarStyle: 'standard', // 侧边栏进度条样式:standard(标准,纵向单列) | compact(紧凑,额度卡两列网格)
     legacyAutoImportedAt: 0, // 安装前历史自动导入标记(issue #27):完成时刻 ms;0 = 尚未跑过
     peakStyle: 'compact', // 峰谷时段条样式:compact(简洁单行/竖向同构) | classic(经典分段/胶囊芯片)
     priceMatch: 'auto', // 未知模型名自动匹配价格表:auto(去后缀/前缀/家族相似) | exact(仅精确)
+    priceMatchDismissed: [], // 从匹配设置中移除的 provider:model 行；不删除用量或改变计价规则。
     priceOverrides: {}, // 手动匹配覆盖:{ 'provider:modelId': 'provider:模型 | deepseek:__default__' };裸模型名 = 同渠道换名(旧版遗留,跨渠道裸 DeepSeek 名由查价兜底自愈,issue #56)
     priceTableDisplay: {}, // 费用设置直接显示(按模型):键 'provider:modelId' → 布尔;缺省 = DeepSeek 模型直接显示、第三方收入拓展价格表(含 DeepSeek 模型也可逐模型收入)
     prices: {
@@ -80,7 +174,7 @@ export function defaultConfig() {
       zai: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '' },
       // MiniMax 自引入起即是「启用即在侧边栏展示 5h/7d 卡片」,显示位置配置落地后默认 both 保持该惯例;
       // 其余厂商默认 settings(仅设置页),按需在设置页切换(issue #31)。
-      minimax: { enabled: false, display: 'both', refreshMinutes: 15, apiKey: '' },
+      minimax: { enabled: false, display: 'both', refreshMinutes: 15, apiKey: '', baseUrl: '' },
       kimi: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '' },
       openrouter: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '' },
       siliconflow: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '' },
@@ -88,6 +182,7 @@ export function defaultConfig() {
       // SCNet Token Plan 无 API 额度端点:按官方 Credits 抵扣表本地估算(issue #26)。
       // planCredits=月度 Credits 额度;planStart=订阅起始日(空 = 自然月)。
       scnet: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '', planCredits: 240000, planStart: '' },
+      qwen: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '', quotaSource: 'local', planCredits: 500000, planStart: '', rates: {} },
       // 火山方舟 Volcano Ark Coding Plan(issue #60):管控面 AK/SK+HMAC,三窗口(5h/weekly/monthly)
       volcengine: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '', accessKeyId: '', secretAccessKey: '' },
     },
@@ -126,6 +221,13 @@ export function defaultConfig() {
         unit: 'USD',
       },
     },
+    // 多配置形态(v1.7.0,issue #79):自定义 Provider 余额支持多条并行,每条
+    // 独立 enabled/display/刷新间隔/请求与解析规则。旧 customBalance 单配置
+    // 在 sanitizeConfig 中自动迁移为 entries[0](有值时),运行期以本数组为准。
+    customBalances: [],
+    // CLIProxyAPI quota sources (issue #87); canonical shape is an object so
+    // future gateway-level options can be added without changing the wire type.
+    gatewayQuotas: { sources: [] },
     corner: {
       enabled: false, // 右下角(composer dock)显示 Go 额度 / 预算 chips
       goRolling: true, // 滚动 5 小时额度
@@ -139,6 +241,16 @@ export function defaultConfig() {
       go: true, // 横条含 Go 额度主窗口
       plans: true, // 横条含已启用的 Coding Plan 窗口
       promptSeen: false, // 首次更新后的功能引导是否已处理(用户自主决定开关)
+    },
+    // 进度条方向(issue #67):各条独立选择填充语义。
+    //  balance = 余额条(官方/自定义):默认 remaining(满条起步随消耗递减);
+    //  budget/go/plan = 预算与额度条:默认 used(空条起步随消耗填满,#57 统一口径)。
+    // 值只能是 'remaining' | 'used',语义为「填充代表什么」。
+    barDirections: {
+      balance: 'remaining',
+      budget: 'used',
+      go: 'used',
+      plan: 'used',
     },
     usage: {
       position: 'cost', // Token 用量统计显示位置:cost(费用设置) | general(通用设置) | section(独立分节)
@@ -170,8 +282,10 @@ export function zeroDay(date) {
 
 /**
  * 聚合某日账本中归属 DeepSeek 官方渠道的费用(USD;issue #36)。
- * 只累加 byProviderModel 里 provider 前缀为 deepseek 的条目(账本记账时未标注
- * provider 的调用同样归入 deepseek);Coding Plan / 自定义 Provider 等渠道不计入。
+ * 只累加 byProviderModel 里 provider 前缀为官方渠道的条目:'deepseek'(账本记账时
+ * 未标注 provider 的调用归入此键)与 'deepseek-official'(profile 内置官方路由的
+ * 实际 provider id,实测账本键形如 deepseek-official:deepseek-v4-flash);Coding
+ * Plan / 自定义 Provider / go、zen 等第三方网关不计入。
  * 无按渠道拆分的旧数据(byProviderModel 缺失/为空)退回全量 cost,保持升级前行为。
  * @param day - 单日账本记录(可能为 undefined)。
  */
@@ -182,7 +296,11 @@ export function officialCostOfDay(day) {
   let sum = 0
   for (const [key, value] of Object.entries(by)) {
     const idx = key.indexOf(':')
-    if ((idx >= 0 ? key.slice(0, idx) : key) !== 'deepseek') continue
+    let provider = idx >= 0 ? key.slice(0, idx) : key
+    // 宿主包装路由(llm-deepseek 等)与裸名同义:剥前缀后再按官方渠道判定,
+    // 与 providerPriceEntryFor / planProviderIdOf 的 llm- 剥离同口径。
+    if (provider.startsWith('llm-')) provider = provider.slice(4)
+    if (provider !== 'deepseek' && provider !== 'deepseek-official') continue
     sum += Number(value?.cost) || 0
   }
   return sum
@@ -292,7 +410,9 @@ export function repairLedgerPricing(ledger) {
       const resolved = providerPriceEntryFor(provider, model, ledger.config.prices, priceOpts)
       if (!resolved.priced || resolved.entry === null) continue
       // 仅修复 flat 模型的误配，deepseek-peak 依赖峰时判定，近似 noon 易误伤
-      if (resolved.billingMode === 'deepseek-peak') continue
+      // 按单次请求上下文分档的模型不能用日聚合 token 猜档位;保留已记成本,
+      // 只允许完整请求日志回放重算,否则多次短请求合计会误套长上下文价格。
+      if (resolved.billingMode === 'deepseek-peak' || resolved.entry.longContext) continue
       const priced = costOf(tokens, resolved.entry, atMsSafe, { enabled: false })
       const newCost = usdFromCost(priced, 'USD', ledger.config.exchangeRate)
       const oldCost = Number(bucket.cost) || 0
@@ -332,7 +452,7 @@ export function repairLedgerPricing(ledger) {
           if ((tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite + tokens.reasoning) === 0) continue
           const resolved = providerPriceEntryFor(provider, model, ledger.config.prices, priceOpts)
           if (!resolved.priced || resolved.entry === null) continue
-          if (resolved.billingMode === 'deepseek-peak') continue
+          if (resolved.billingMode === 'deepseek-peak' || resolved.entry.longContext) continue
           const priced = costOf(tokens, resolved.entry, sessAtMs, { enabled: false })
           const newCost = usdFromCost(priced, 'USD', ledger.config.exchangeRate)
           const oldCost = Number(bucket.cost) || 0
@@ -359,6 +479,155 @@ export function repairLedgerPricing(ledger) {
     }
   }
   return { touchedDays, touchedSessions, recostedBuckets }
+}
+
+/**
+ * 本地模型误价一次性清洗(issue #76 附带)。
+ *
+ * v1.6.10 及之前,本地网关模型(lmstudio:qwen3.8-9b-heretic-… 等)经自动
+ * 匹配被误套同家族云端价(实测按阿里 qwen3.8-max 单价 64 次多计 $3.29)。
+ * 实时守卫(isLocalOriginProviderOrModel 零价)堵住新污染后,本迁移把历史
+ * 存量中本地来源 provider:model 桶的费用归零(token 与 calls 保留,费用与
+ * apiCost 从所在日/会话合计中同步扣回)。幂等:已归零的桶扣减量为 0。
+ * planHourBuckets 不动:本地渠道不参与订阅额度分类,若有零星误入也只影响
+ * 等值口径且无法从聚合桶中按模型拆分。
+ * @param ledger - 已打开的账本(原地修改)。
+ * @returns { touchedDays, touchedSessions, zeroedBuckets } 归零的桶数与触及的天/会话数。
+ */
+export function unpriceLocalOriginModels(ledger) {
+  const overrides = ledger.config?.priceOverrides !== null && typeof ledger.config?.priceOverrides === 'object' ? ledger.config.priceOverrides : {}
+  const touched = { touchedDays: 0, touchedSessions: 0, zeroedBuckets: 0 }
+  const isLocalKey = (key) => {
+    // 显式「本地模型(零消耗)」覆盖哨兵(UI 可对任意已命中模型标记,issue #76 后续)。
+    if (overrides[key] === '__local__') return true
+    const sep = key.indexOf(':')
+    const rawProvider = (sep >= 0 ? key.slice(0, sep) : 'deepseek').toLowerCase()
+    const provider = rawProvider.startsWith('llm-') ? rawProvider.slice(4) : rawProvider
+    const model = sep >= 0 ? key.slice(sep + 1) : key
+    return isLocalOriginProviderOrModel(provider, model)
+  }
+  // 逐容器(day 或 session)把本地来源桶的费用归零,并从容器合计扣回。
+  const repairContainer = (container) => {
+    if (container === null || typeof container !== 'object') return { changed: false, zeroed: 0, delta: 0, apiDelta: 0 }
+    let zeroed = 0
+    let delta = 0
+    let apiDelta = 0
+    for (const [key, bucket] of Object.entries(container.byProviderModel ?? {})) {
+      if (bucket === null || typeof bucket !== 'object') continue
+      if (!isLocalKey(key)) continue
+      const cost = Number(bucket.cost) || 0
+      const apiCost = Number.isFinite(Number(bucket.apiCost)) ? Number(bucket.apiCost) : cost
+      if (cost === 0 && apiCost === 0) continue
+      delta -= cost
+      apiDelta -= apiCost
+      bucket.cost = 0
+      bucket.apiCost = 0
+      zeroed += 1
+    }
+    if (zeroed === 0) return { changed: false, zeroed: 0, delta: 0, apiDelta: 0 }
+    container.cost = Math.max(0, (Number(container.cost) || 0) + delta)
+    const prevApi = Number.isFinite(Number(container.apiCost)) ? Number(container.apiCost) : (Number(container.cost) || 0)
+    container.apiCost = Math.max(0, Math.min(container.cost, prevApi + apiDelta))
+    return { changed: true, zeroed, delta, apiDelta }
+  }
+  for (const day of Object.values(ledger.days ?? {})) {
+    if (day === null || typeof day !== 'object') continue
+    const dayResult = repairContainer(day)
+    if (dayResult.changed) touched.touchedDays += 1
+    touched.zeroedBuckets += dayResult.zeroed
+    for (const session of Array.isArray(day.sessions) ? day.sessions : []) {
+      const sessionResult = repairContainer(session)
+      if (sessionResult.changed) touched.touchedSessions += 1
+      touched.zeroedBuckets += sessionResult.zeroed
+    }
+  }
+  return touched
+}
+
+/**
+ * modlens 视觉包装层镜像一次性清洗(issue #70)。
+ *
+ * 现行 modlens(modlens-<upstream> / deepseek-modlens)在监听器体内急切发起
+ * 上游 llm.stream,逃逸 billing-stream 的 ALS 嵌套标记,同一次调用在上游与
+ * 包装层两个 provider 键下各入账一次(六值桶逐位相同),token/费用整体翻倍。
+ *
+ * 与 provider-dedup-v1(issue #48 指纹合并,保留字母序第一个键)的遗留交互
+ * 需要区分三种形态,逐容器(day 与其下每个 session)处理:
+ *  1. 镜像对:上游键与包装层键六值桶全等 → 从容器合计扣除包装层份并删除
+ *     (真实上游键本就存在,扣减即恢复真实值);
+ *  2. 包装层 ⊃ 上游(#48 合并过旧镜像、之后又积累新镜像的混存形态:
+ *     包装层键 = 合并残留 + 新镜像,上游键 = 新镜像):上游键是包装层键的
+ *     子集 → 扣除并删除上游键,包装层键改挂上游 provider 名;
+ *  3. 无上游键(仅有包装层入账,如 #48 合并后只剩字母序靠前的包装层键):
+ *     包装层键改挂上游 provider 名,合计不动;
+ *  4. 包装层 ⊂ 上游(同日直连 + 包装调用混存:上游键 = 直连量 + 全部包装
+ *     调用量,包装层键是纯镜像子集)→ 从容器合计扣除包装层份并删除。
+ * 六值桶互不为子集(无法安全判定)的条目不动(保守);幂等,二次运行无
+ * 包装层键时返回 0。调用方以账本 migrations 标记保证只跑一次。
+ * @param days - 账本每日记录对象(原地修改)。
+ * @returns { removed, renamed } 扣除删除的镜像条目数 / 改挂上游键的条目数。
+ */
+export function dedupeWrapperProviderDays(days) {
+  const result = { removed: 0, renamed: 0 }
+  const FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning', 'calls']
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0)
+  const fingerprint = (b) => FIELDS.map(f => num(b?.[f])).join('|')
+  const isSubset = (small, big) => FIELDS.every(f => num(small?.[f]) <= num(big?.[f]))
+  const subtractInto = (container, bucket) => {
+    for (const f of [...FIELDS, 'cost', 'apiCost']) {
+      container[f] = Math.max(0, num(container[f]) - num(bucket?.[f]))
+    }
+  }
+  const repairContainer = (container) => {
+    const pm = container?.byProviderModel
+    if (pm === null || typeof pm !== 'object' || Array.isArray(pm)) return
+    for (const key of Object.keys(pm)) {
+      const sep = key.indexOf(':')
+      if (sep <= 0) continue
+      const provider = key.slice(0, sep)
+      if (!isWrapperProviderId(provider)) continue
+      const model = key.slice(sep + 1)
+      const upstream = wrapperUpstreamProvider(provider)
+      if (upstream === null) continue
+      const bucket = pm[key]
+      const twinKey = `${upstream}:${model}`
+      const twin = pm[twinKey]
+      if (twin === undefined) {
+        // 形态 3:仅包装层入账——改挂上游键,容器合计不动。
+        delete pm[key]
+        pm[twinKey] = bucket
+        result.renamed += 1
+      } else if (fingerprint(twin) === fingerprint(bucket)) {
+        // 形态 1:经典镜像对——扣除包装层份并删除,上游键即真实值。
+        subtractInto(container, bucket)
+        delete pm[key]
+        result.removed += 1
+      } else if (isSubset(twin, bucket)) {
+        // 形态 2:上游键 ⊆ 包装层键(混存残留)——扣除并删除上游键,包装层改挂上游。
+        subtractInto(container, twin)
+        delete pm[key]
+        pm[twinKey] = bucket
+        result.renamed += 1
+      } else if (isSubset(bucket, twin)) {
+        // 形态 4:包装层键 ⊆ 上游键(同日直连 + 包装调用混存:上游键含直连量 +
+        // 全部包装调用量,包装层键是纯镜像子集)——扣除包装层份并删除。
+        subtractInto(container, bucket)
+        delete pm[key]
+        result.removed += 1
+      }
+      // 其余:互不为子集,无法安全判定,保守不动。
+    }
+  }
+  for (const day of Object.values(days ?? {})) {
+    if (day === null || typeof day !== 'object') continue
+    repairContainer(day)
+    if (Array.isArray(day.sessions)) {
+      for (const session of day.sessions) {
+        if (session !== null && typeof session === 'object') repairContainer(session)
+      }
+    }
+  }
+  return result
 }
 
 function zeroSession(id) {
@@ -464,9 +733,15 @@ const VALIDATION_MESSAGES = {
     hideOfficialBalance: 'hideOfficialBalance 必须是布尔值',
     hideTodayCost: 'hideTodayCost 必须是布尔值',
     showTotalWithPlan: 'showTotalWithPlan 必须是布尔值',
+    includeSubagentCost: 'includeSubagentCost 必须是布尔值',
+    codexQuotaEnabled: 'codexQuotaEnabled 必须是布尔值',
+    sidebarSimple: '简化显示设置必须是布尔值',
+    sidebarModels: '模型花费卡片设置无效：Top-N 为 1–10，刷新间隔为 10–60 秒',
+    sidebarStyle: 'sidebarStyle 必须是 standard / compact',
     peakStyle: 'peakStyle 必须是 compact / classic',
     priceMatch: 'priceMatch 必须是 auto / exact',
     priceOverrides: 'priceOverrides 必须是字符串→字符串映射',
+    priceMatchDismissed: 'priceMatchDismissed 必须是模型键字符串数组（最多 1000 项，每项 1–512 字符）',
     historyDays: 'historyDays 必须是 7-3650 的整数',
     locale: 'locale 必须是 auto / zh / en',
     budget: 'budget 非法',
@@ -486,16 +761,33 @@ const VALIDATION_MESSAGES = {
     balanceBudgetCap: 'balance.budgetCap 必须是非负数或 null',
     goQuota: 'goQuota 非法',
     customBalance: 'customBalance 非法',
+    customBalanceAdapter: 'customBalance.adapter 必须是 custom / aliyun',
     customBalanceEnabled: 'customBalance.enabled 必须是布尔值',
     customBalanceDisplay: 'customBalance.display 必须是 sidebar / settings / both / off',
     customBalanceRefresh: 'customBalance.refreshMinutes 必须是 1-1440 的整数',
     customBalanceLabel: 'customBalance.label 必须是字符串',
     customBalanceLabelEn: 'customBalance.labelEn 必须是字符串',
-    customBalanceUnit: 'customBalance.unit 必须是 USD / CNY / EUR',
+    customBalanceUnit: 'customBalance.unit 必须是 USD / CNY / EUR / CREDITS',
     customBalanceRequest: 'customBalance.request.url 必须是非空字符串',
     customBalanceHeaders: 'customBalance.request.headers 必须是字符串→字符串映射',
     customBalanceExtract: 'customBalance.extract 必须是对象',
-    goQuotaEnabled: 'goQuota.enabled 必须是布尔值',
+    customBalances: 'customBalances 必须是数组',
+    customBalancesTooMany: '自定义 Provider 余额配置最多 8 条',
+    gatewayQuotas: 'gatewayQuotas 非法',
+     gatewayQuotasSources: 'gatewayQuotas.sources 必须是数组',
+     gatewayQuotasTooMany: 'gatewayQuotas 最多配置 4 个来源',
+     gatewayQuotaSource: 'gateway quota 来源配置非法',
+     gatewayQuotaId: 'gateway quota 来源 id 必须是 1-48 位小写字母、数字、下划线或短横线',
+     gatewayQuotaIdDuplicate: 'gateway quota 来源 id 不能重复',
+     gatewayQuotaType: 'gateway quota 来源 type 必须是 cliproxyapi',
+     gatewayQuotaLabel: 'gateway quota 来源 label 必须是字符串且不超过 80 个字符',
+     gatewayQuotaBaseURL: 'gateway quota 来源 baseURL 必须是合法 origin',
+     gatewayQuotaDisplay: 'gateway quota 来源 display 必须是 sidebar / settings / both / off',
+     gatewayQuotaRefresh: 'gateway quota 来源 refreshMinutes 必须是 1-1440 的整数',
+     gatewayQuotaProviders: 'gateway quota 来源 includeProviders 含未知 provider',
+     gatewayQuotaHosts: 'gateway quota 来源 allowedHosts 必须是字符串数组',
+     gatewayQuotaHttp: '非 loopback HTTP 来源必须显式开启 allowInsecureHttp',
+     goQuotaEnabled: 'goQuota.enabled 必须是布尔值',
     goQuotaDisplay: 'goQuota.display 必须是 sidebar / settings / both / off',
     goQuotaRefresh: 'goQuota.refreshMinutes 必须是 1-1440 的整数',
     goQuotaKey: 'goQuota.apiKey 必须是字符串',
@@ -506,6 +798,8 @@ const VALIDATION_MESSAGES = {
     cornerFlag: 'corner.{field} 必须是布尔值',
     quotaStrip: 'quotaStrip 非法',
     quotaStripFlag: 'quotaStrip.{field} 必须是布尔值',
+    barDirections: 'barDirections 非法',
+    barDirectionValue: 'barDirections.{field} 必须是 remaining / used',
     usage: 'usage 非法',
     usagePosition: 'usage.position 必须是 cost / general / section',
     planBilling: 'planBilling 非法',
@@ -541,9 +835,15 @@ const VALIDATION_MESSAGES = {
     hideOfficialBalance: 'hideOfficialBalance must be a boolean',
     hideTodayCost: 'hideTodayCost must be a boolean',
     showTotalWithPlan: 'showTotalWithPlan must be a boolean',
+    includeSubagentCost: 'includeSubagentCost must be a boolean',
+    codexQuotaEnabled: 'codexQuotaEnabled must be a boolean',
+    sidebarSimple: 'Simple display settings must be boolean',
+    sidebarModels: 'Invalid model cost card settings: Top-N must be 1–10 and refresh interval 10–60 seconds',
+    sidebarStyle: 'sidebarStyle must be standard / compact',
     peakStyle: 'peakStyle must be compact / classic',
     priceMatch: 'priceMatch must be auto / exact',
     priceOverrides: 'priceOverrides must be a string→string map',
+    priceMatchDismissed: 'priceMatchDismissed must contain at most 1000 model keys of 1–512 characters',
     historyDays: 'historyDays must be an integer from 7 to 3650',
     locale: 'locale must be auto / zh / en',
     budget: 'Invalid budget',
@@ -563,15 +863,32 @@ const VALIDATION_MESSAGES = {
     balanceBudgetCap: 'balance.budgetCap must be a non-negative number or null',
     goQuota: 'Invalid goQuota',
     customBalance: 'Invalid customBalance',
+    customBalanceAdapter: 'customBalance.adapter must be custom / aliyun',
     customBalanceEnabled: 'customBalance.enabled must be a boolean',
     customBalanceDisplay: 'customBalance.display must be sidebar / settings / both / off',
     customBalanceRefresh: 'customBalance.refreshMinutes must be an integer from 1 to 1440',
     customBalanceLabel: 'customBalance.label must be a string',
     customBalanceLabelEn: 'customBalance.labelEn must be a string',
-    customBalanceUnit: 'customBalance.unit must be USD / CNY / EUR',
+    customBalanceUnit: 'customBalance.unit must be USD / CNY / EUR / CREDITS',
     customBalanceRequest: 'customBalance.request.url must be a non-empty string',
     customBalanceHeaders: 'customBalance.request.headers must be a string→string map',
     customBalanceExtract: 'customBalance.extract must be an object',
+    customBalances: 'customBalances must be an array',
+    customBalancesTooMany: 'At most 8 custom provider balance entries are allowed',
+     gatewayQuotas: 'Invalid gatewayQuotas',
+     gatewayQuotasSources: 'gatewayQuotas.sources must be an array',
+     gatewayQuotasTooMany: 'At most 4 gateway quota sources are allowed',
+     gatewayQuotaSource: 'Invalid gateway quota source',
+     gatewayQuotaId: 'gateway quota source id must match [a-z0-9][a-z0-9_-]{0,47}',
+     gatewayQuotaIdDuplicate: 'gateway quota source ids must be unique',
+     gatewayQuotaType: 'gateway quota source type must be cliproxyapi',
+     gatewayQuotaLabel: 'gateway quota source label must be a string of at most 80 characters',
+     gatewayQuotaBaseURL: 'gateway quota source baseURL must be a valid origin',
+     gatewayQuotaDisplay: 'gateway quota source display must be sidebar / settings / both / off',
+     gatewayQuotaRefresh: 'gateway quota source refreshMinutes must be an integer from 1 to 1440',
+     gatewayQuotaProviders: 'gateway quota source includeProviders contains an unknown provider',
+     gatewayQuotaHosts: 'gateway quota source allowedHosts must be a string array',
+     gatewayQuotaHttp: 'non-loopback HTTP gateway sources require allowInsecureHttp',
     goQuotaEnabled: 'goQuota.enabled must be a boolean',
     goQuotaDisplay: 'goQuota.display must be sidebar / settings / both / off',
     goQuotaRefresh: 'goQuota.refreshMinutes must be an integer from 1 to 1440',
@@ -583,6 +900,8 @@ const VALIDATION_MESSAGES = {
     cornerFlag: 'corner.{field} must be a boolean',
     quotaStrip: 'Invalid quotaStrip',
     quotaStripFlag: 'quotaStrip.{field} must be a boolean',
+    barDirections: 'Invalid barDirections',
+    barDirectionValue: 'barDirections.{field} must be remaining / used',
     usage: 'Invalid usage',
     usagePosition: 'usage.position must be cost / general / section',
     planBilling: 'Invalid planBilling',
@@ -611,16 +930,82 @@ function patchLocale(current, patch) {
 }
 
 /**
+ * 剥掉配置补丁里的密钥字段(v1.6.8)。
+ *
+ * 密钥只能经 setCredential 写入 DSH 凭据库,不再走配置补丁:若放任明文经补丁进
+ * config,虽然 flush() 会脱敏、不会写盘,但**内存里的明文会一直存在**,而且永远
+ * 轮不到 runSecretMigration 迁走(迁移只认 config 首屏遗留值,补丁写入的新明文会
+ * 覆盖掉待迁移的原始值,事实上造成密钥丢失)。旧客户端或手工改配置时的兼容闸门。
+ *
+ * v1.7.6(issue #86)同闸门扩展到自定义余额请求头:补丁里疑似明文密钥的头值置空
+ * (占位符与普通头照常通过)——新密钥只能经 setCredential 的 customVar:<NAME>
+ * 目标写入,不再有明文进 config 的旁路。
+ *
+ * @param patch - 客户端提交的补丁(JSON)。
+ * @returns 去掉密钥字段后的补丁副本(浅拷贝路径上的对象,不改原对象)。
+ */
+export function stripSecretPatch(patch) {
+  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) return patch
+  const out = { ...patch }
+  if (out.goQuota !== null && typeof out.goQuota === 'object' && !Array.isArray(out.goQuota)) {
+    const goQuota = { ...out.goQuota }
+    if ('apiKey' in goQuota) goQuota.apiKey = ''
+    out.goQuota = goQuota
+  }
+  if (out.codingPlans !== null && typeof out.codingPlans === 'object' && !Array.isArray(out.codingPlans)) {
+    const plans = {}
+    for (const [id, entry] of Object.entries(out.codingPlans)) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) { plans[id] = entry; continue }
+      const copy = { ...entry }
+      if ('apiKey' in copy) copy.apiKey = ''
+      if ('accessKeyId' in copy) copy.accessKeyId = ''
+      if ('secretAccessKey' in copy) copy.secretAccessKey = ''
+      plans[id] = copy
+    }
+    out.codingPlans = plans
+  }
+  if (out.customBalance !== null && typeof out.customBalance === 'object' && !Array.isArray(out.customBalance)) {
+    out.customBalance = redactCustomBalanceEntry(out.customBalance)
+  }
+  if (Array.isArray(out.customBalances)) {
+    out.customBalances = out.customBalances.map(redactCustomBalanceEntry)
+  }
+  if (Array.isArray(out.gatewayQuotas)) {
+    out.gatewayQuotas = out.gatewayQuotas.map(source => {
+      if (source === null || typeof source !== 'object' || Array.isArray(source)) return source
+      const copy = { ...source }
+      for (const key of ['managementKey', 'apiKey', 'key', 'token']) delete copy[key]
+      return copy
+    })
+  } else if (out.gatewayQuotas !== null && typeof out.gatewayQuotas === 'object') {
+    const gatewayQuotas = { ...out.gatewayQuotas }
+    if (Array.isArray(gatewayQuotas.sources)) {
+      gatewayQuotas.sources = gatewayQuotas.sources.map(source => {
+        if (source === null || typeof source !== 'object' || Array.isArray(source)) return source
+        const copy = { ...source }
+        for (const key of ['managementKey', 'apiKey', 'key', 'token']) delete copy[key]
+        return copy
+      })
+    }
+    out.gatewayQuotas = gatewayQuotas
+  }
+  return out
+}
+
+/**
  * 校验并应用一份配置补丁,返回 { config, errors }。
  * 未知键、非法值都会报错且整体不落盘;合法补丁深合并后持久化。
  * @param current - 当前配置。
- * @param patch - 客户端提交的补丁(JSON)。
+ * @param rawPatch - 客户端提交的补丁(JSON)。
  */
-export function applyConfigPatch(current, patch) {
-  const locale = patchLocale(current, patch)
-  if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+export function applyConfigPatch(current, rawPatch) {
+  const locale = patchLocale(current, rawPatch)
+  if (rawPatch === null || typeof rawPatch !== 'object' || Array.isArray(rawPatch)) {
     return { config: current, errors: [vmsg(locale, 'patchObject')] }
   }
+  // 密钥剥离放在**最底层**的补丁入口:任何调用方(updateConfig、测试、未来新增 RPC)
+  // 都天然受保护,密钥只能经 setCredential 写入凭据库,绝不允许经补丁回到 config。
+  const patch = stripSecretPatch(rawPatch)
   const errors = []
   for (const key of Object.keys(patch)) {
     if (!CONFIG_KEYS.includes(key)) errors.push(vmsg(locale, 'unknownKey', { key }))
@@ -628,9 +1013,20 @@ export function applyConfigPatch(current, patch) {
   if (errors.length > 0) return { config: current, errors }
   // 结构化克隆,拒绝补丁时不得污染活配置(mergeDeep 共享未触及子树,校验期的就地收敛会泄漏进活配置)。
   const candidate = mergeDeep(structuredClone(current), patch)
+  // 这两张编辑表随对应设置整表提交；逐键深合并会把用户移除的键补回来。
+  if (Object.hasOwn(patch, 'priceOverrides')) candidate.priceOverrides = structuredClone(patch.priceOverrides)
+  const qwenPatch = patch.codingPlans?.qwen
+  if (qwenPatch !== null && typeof qwenPatch === 'object' && !Array.isArray(qwenPatch) && Object.hasOwn(qwenPatch, 'rates')) {
+    candidate.codingPlans.qwen.rates = structuredClone(qwenPatch.rates)
+  }
   // prices.models 是可编辑列表:客户端提交完整列表时必须按替换语义处理，
   // 否则 mergeDeep 会把已删除的旧模型重新合并回来。
   if (patch.prices !== null && typeof patch.prices === 'object' && !Array.isArray(patch.prices)) {
+    // 默认价卡片也是完整记录，清空某档位时不能被深合并复活。
+    const defaultPatch = patch.prices.default
+    if (defaultPatch && ['cacheHit', 'cacheMiss', 'output'].every(key => Object.hasOwn(defaultPatch, key))) {
+      candidate.prices.default = structuredClone(defaultPatch)
+    }
     if (patch.prices.models !== null && typeof patch.prices.models === 'object' && !Array.isArray(patch.prices.models)) {
       candidate.prices.models = patch.prices.models
     }
@@ -652,7 +1048,7 @@ export function applyConfigPatch(current, patch) {
   if (candidate.codingPlans === null || typeof candidate.codingPlans !== 'object' || Array.isArray(candidate.codingPlans)) {
     candidate.codingPlans = {}
   }
-  // codingPlans 逐项清洗:只保留已知提供商;字段非法则回退默认值(凭据只发往各家官方端点)。
+  // codingPlans 逐项清洗:只保留已知提供商；MiniMax 自定义 origin 非法时拒绝补丁。
   for (const [id, raw] of Object.entries(candidate.codingPlans)) {
     if (!CODING_PLAN_PROVIDER_IDS.includes(id) || raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
       delete candidate.codingPlans[id]
@@ -664,11 +1060,36 @@ export function applyConfigPatch(current, patch) {
     const minutes = Number(entry.refreshMinutes)
     entry.refreshMinutes = Number.isFinite(minutes) && minutes >= 1 && minutes <= 1440 ? minutes : 15
     entry.apiKey = typeof entry.apiKey === 'string' ? entry.apiKey : ''
+    if (id === 'minimax') {
+      const origin = normalizeMiniMaxBaseUrl(entry.baseUrl)
+      if (origin === null) errors.push(locale === 'zh' ? 'MiniMax 查询域名必须是 HTTPS 地址，仅含主机和可选端口，不含路径、账号、查询参数或片段。' : 'MiniMax quota origin must use HTTPS with only a host and optional port; no path, credentials, query or fragment.')
+      else entry.baseUrl = origin
+    }
     // SCNet 本地计量专用字段:月度 Credits 额度与订阅起始日。
     if (id === 'scnet') {
       const credits = Number(entry.planCredits)
       entry.planCredits = Number.isFinite(credits) && credits > 0 ? credits : 240000
       entry.planStart = typeof entry.planStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry.planStart) ? entry.planStart : ''
+    }
+    // 千问 Token Plan 本地计量专用字段(issue #78):月度 Credits 额度、订阅起始日
+    // 与抵扣率覆盖(归一模型名 → { input, cachedInput, output },仅正有限数保留)。
+    if (id === 'qwen') {
+      entry.quotaSource = entry.quotaSource === 'cli' ? 'cli' : 'local'
+      const credits = Number(entry.planCredits)
+      entry.planCredits = Number.isFinite(credits) && credits > 0 ? credits : 500000
+      entry.planStart = typeof entry.planStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry.planStart) ? entry.planStart : ''
+      const rates = entry.rates !== null && typeof entry.rates === 'object' && !Array.isArray(entry.rates) ? entry.rates : {}
+      const cleaned = {}
+      for (const [model, rate] of Object.entries(rates)) {
+        if (typeof model !== 'string' || model.length === 0 || rate === null || typeof rate !== 'object') continue
+        const num = v => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null }
+        const input = num(rate.input)
+        const cachedInput = num(rate.cachedInput)
+        const output = num(rate.output)
+        if (input === null || cachedInput === null || output === null) continue
+        cleaned[model] = { input, cachedInput, output }
+      }
+      entry.rates = cleaned
     }
     // 火山方舟专用:AccessKeyID/SecretAccessKey(双凭据,空 = 未配置)。
     if (id === 'volcengine') {
@@ -711,9 +1132,27 @@ export function applyConfigPatch(current, patch) {
   if (candidate.hideTodayCost !== undefined && typeof candidate.hideTodayCost !== 'boolean') errors.push(vmsg(locale, 'hideTodayCost'))
   // 「含 Plan 总额」全局开关(v1.6.0):布尔,可缺省(默认关)。
   if (candidate.showTotalWithPlan !== undefined && typeof candidate.showTotalWithPlan !== 'boolean') errors.push(vmsg(locale, 'showTotalWithPlan'))
+  for (const field of ['includeSubagentCost', 'codexQuotaEnabled']) {
+    if (candidate[field] !== undefined && typeof candidate[field] !== 'boolean') errors.push(vmsg(locale, field))
+  }
+  // 侧边栏进度条样式:standard(默认,纵向单列) | compact(额度卡两列网格)。
+  for (const field of ['sidebarSimple', 'sidebarSimplePromptSeen']) {
+    if (candidate[field] !== undefined && typeof candidate[field] !== 'boolean') errors.push(vmsg(locale, 'sidebarSimple'))
+  }
+  if (candidate.sidebarStyle !== undefined && candidate.sidebarStyle !== 'standard' && candidate.sidebarStyle !== 'compact') errors.push(vmsg(locale, 'sidebarStyle'))
+  const sm = candidate.sidebarModels
+  if (!sm || typeof sm !== 'object' || Array.isArray(sm)
+    || ['enabled', 'defaultOpen', 'remember', 'tokens', 'shares', 'dock'].some(k => typeof sm[k] !== 'boolean')
+    || !['today', 'history'].includes(sm.period) || !['total', 'top'].includes(sm.summary) || !['first', 'afterBalance', 'last'].includes(sm.position)
+    || !Number.isInteger(sm.topN) || sm.topN < 1 || sm.topN > 10 || !Number.isInteger(sm.refreshSeconds) || sm.refreshSeconds < 10 || sm.refreshSeconds > 60) errors.push(vmsg(locale, 'sidebarModels'))
   if (candidate.peakStyle !== 'compact' && candidate.peakStyle !== 'classic') errors.push(vmsg(locale, 'peakStyle'))
   if (candidate.priceMatch !== 'auto' && candidate.priceMatch !== 'exact') errors.push(vmsg(locale, 'priceMatch'))
   const overrides = candidate.priceOverrides
+  if (candidate.priceMatchDismissed !== undefined && (!Array.isArray(candidate.priceMatchDismissed)
+    || candidate.priceMatchDismissed.length > 1000
+    || candidate.priceMatchDismissed.some(key => typeof key !== 'string' || key.length === 0 || key.length > 512))) {
+    errors.push(vmsg(locale, 'priceMatchDismissed'))
+  }
   if (overrides === null || typeof overrides !== 'object' || Array.isArray(overrides)
     || Object.entries(overrides).some(([k, v]) => typeof k !== 'string' || typeof v !== 'string')) {
     errors.push(vmsg(locale, 'priceOverrides'))
@@ -771,31 +1210,88 @@ export function applyConfigPatch(current, patch) {
       else balance.budgetCap = cap > 0 ? cap : null
     }
   }
-  // 自定义 Provider 余额校验。
-  const customBalance = candidate.customBalance
-  if (customBalance !== undefined) {
-    if (customBalance === null || typeof customBalance !== 'object' || Array.isArray(customBalance)) {
+  // 自定义 Provider 余额校验(v1.7.0 起支持多配置,issue #79)。
+  // 单条校验逻辑对 customBalance(旧单配置)与 customBalances[n](新数组)复用。
+  const validateCustomBalanceEntry = (entry, fieldPrefix) => {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) {
       errors.push(vmsg(locale, 'customBalance'))
+      return
+    }
+    if (typeof entry.enabled !== 'boolean') errors.push(vmsg(locale, fieldPrefix + 'Enabled'))
+    if (entry.adapter !== undefined && !['custom', 'aliyun'].includes(entry.adapter)) errors.push(vmsg(locale, fieldPrefix + 'Adapter'))
+    if (!['sidebar', 'settings', 'both', 'off'].includes(entry.display)) errors.push(vmsg(locale, fieldPrefix + 'Display'))
+    const refreshMinutes = Number(entry.refreshMinutes)
+    if (!Number.isInteger(refreshMinutes) || refreshMinutes < 1 || refreshMinutes > 1440) errors.push(vmsg(locale, fieldPrefix + 'Refresh'))
+    else entry.refreshMinutes = refreshMinutes
+    if (typeof entry.label !== 'string') errors.push(vmsg(locale, fieldPrefix + 'Label'))
+    if (entry.labelEn !== undefined && typeof entry.labelEn !== 'string') errors.push(vmsg(locale, fieldPrefix + 'LabelEn'))
+    if (entry.unit !== undefined && !['USD', 'CNY', 'EUR', 'CREDITS'].includes(entry.unit)) errors.push(vmsg(locale, fieldPrefix + 'Unit'))
+    const request = entry.request
+    // url 仅在启用时必填:默认禁用状态下不能阻断其它配置项的保存。
+    if (request === null || typeof request !== 'object' || Array.isArray(request) || typeof request.url !== 'string' || (entry.enabled === true && request.url.length === 0)) {
+      errors.push(vmsg(locale, fieldPrefix + 'Request'))
+    } else if (request.headers !== undefined && (request.headers === null || typeof request.headers !== 'object' || Array.isArray(request.headers)
+      || Object.values(request.headers).some(value => typeof value !== 'string'))) {
+      // 值非字符串会击穿 typert strict configSchema(z.record(string, string)),导致整个 getState 被拒。
+      errors.push(vmsg(locale, fieldPrefix + 'Headers'))
+    }
+    const extract = entry.extract
+    if (extract === null || typeof extract !== 'object' || Array.isArray(extract)) errors.push(vmsg(locale, fieldPrefix + 'Extract'))
+  }
+  const customBalance = candidate.customBalance
+  if (customBalance !== undefined) validateCustomBalanceEntry(customBalance, 'customBalance')
+  // 数组形态:上限 8 条(设置页逐条编辑,超出的截断并报错)。
+  const customBalances = candidate.customBalances
+  if (customBalances !== undefined) {
+    if (!Array.isArray(customBalances)) {
+      errors.push(vmsg(locale, 'customBalances'))
     } else {
-      if (typeof customBalance.enabled !== 'boolean') errors.push(vmsg(locale, 'customBalanceEnabled'))
-      if (!['sidebar', 'settings', 'both', 'off'].includes(customBalance.display)) errors.push(vmsg(locale, 'customBalanceDisplay'))
-      const refreshMinutes = Number(customBalance.refreshMinutes)
-      if (!Number.isInteger(refreshMinutes) || refreshMinutes < 1 || refreshMinutes > 1440) errors.push(vmsg(locale, 'customBalanceRefresh'))
-      else customBalance.refreshMinutes = refreshMinutes
-      if (typeof customBalance.label !== 'string') errors.push(vmsg(locale, 'customBalanceLabel'))
-      if (customBalance.labelEn !== undefined && typeof customBalance.labelEn !== 'string') errors.push(vmsg(locale, 'customBalanceLabelEn'))
-      if (customBalance.unit !== undefined && !['USD', 'CNY', 'EUR'].includes(customBalance.unit)) errors.push(vmsg(locale, 'customBalanceUnit'))
-      const request = customBalance.request
-      // url 仅在启用时必填:默认禁用状态下不能阻断其它配置项的保存。
-      if (request === null || typeof request !== 'object' || Array.isArray(request) || typeof request.url !== 'string' || (customBalance.enabled === true && request.url.length === 0)) {
-        errors.push(vmsg(locale, 'customBalanceRequest'))
-      } else if (request.headers !== undefined && (request.headers === null || typeof request.headers !== 'object' || Array.isArray(request.headers)
-        || Object.values(request.headers).some(value => typeof value !== 'string'))) {
-        // 值非字符串会击穿 typert strict configSchema(z.record(string, string)),导致整个 getState 被拒。
-        errors.push(vmsg(locale, 'customBalanceHeaders'))
+      if (customBalances.length > 8) errors.push(vmsg(locale, 'customBalancesTooMany'))
+      customBalances.slice(0, 8).forEach(entry => validateCustomBalanceEntry(entry, 'customBalance'))
+    }
+  }
+  // CLIProxyAPI gateway source 校验：只允许固定 provider、origin 和精确远端 host。
+  const gatewayQuotas = candidate.gatewayQuotas
+  if (gatewayQuotas === undefined) {
+    // 旧客户端/旧配置补丁不携带此字段时保持兼容；defaultConfig 会在正常运行态提供 canonical 对象。
+  } else if (gatewayQuotas === null || typeof gatewayQuotas !== 'object' || Array.isArray(gatewayQuotas)) {
+    errors.push(vmsg(locale, 'gatewayQuotas'))
+  } else if (!Array.isArray(gatewayQuotas.sources)) {
+    errors.push(vmsg(locale, 'gatewayQuotasSources'))
+  } else {
+    if (gatewayQuotas.sources.length > 4) errors.push(vmsg(locale, 'gatewayQuotasTooMany'))
+    const ids = new Set()
+    for (const source of gatewayQuotas.sources.slice(0, 4)) {
+      if (source === null || typeof source !== 'object' || Array.isArray(source)) {
+        errors.push(vmsg(locale, 'gatewayQuotaSource'))
+        continue
       }
-      const extract = customBalance.extract
-      if (extract === null || typeof extract !== 'object' || Array.isArray(extract)) errors.push(vmsg(locale, 'customBalanceExtract'))
+      if (typeof source.id !== 'string' || !GATEWAY_SOURCE_ID_RE.test(source.id)) errors.push(vmsg(locale, 'gatewayQuotaId'))
+      else if (ids.has(source.id)) errors.push(vmsg(locale, 'gatewayQuotaIdDuplicate'))
+      else ids.add(source.id)
+      if (source.type !== 'cliproxyapi') errors.push(vmsg(locale, 'gatewayQuotaType'))
+      if (typeof source.label !== 'string' || source.label.length > 80) errors.push(vmsg(locale, 'gatewayQuotaLabel'))
+      if (typeof source.enabled !== 'boolean') errors.push(vmsg(locale, 'gatewayQuotaSource'))
+      if (typeof source.baseURL !== 'string' || !gatewayOriginIsValid(source.baseURL)) errors.push(vmsg(locale, 'gatewayQuotaBaseURL'))
+      if (!GATEWAY_DISPLAY_VALUES.includes(source.display)) errors.push(vmsg(locale, 'gatewayQuotaDisplay'))
+      const refresh = Number(source.refreshMinutes)
+      if (!Number.isInteger(refresh) || refresh < 1 || refresh > 1440) errors.push(vmsg(locale, 'gatewayQuotaRefresh'))
+      if (!Array.isArray(source.includeProviders) || source.includeProviders.length === 0
+        || source.includeProviders.some(provider => typeof provider !== 'string' || !GATEWAY_PROVIDER_IDS.includes(provider))) {
+        errors.push(vmsg(locale, 'gatewayQuotaProviders'))
+      }
+      if (!Array.isArray(source.allowedHosts) || source.allowedHosts.length > 16 || source.allowedHosts.some(host => !gatewayAllowedHostIsValid(host))) {
+        errors.push(vmsg(locale, 'gatewayQuotaHosts'))
+      }
+      if (Array.isArray(source.allowedHosts) && typeof source.baseURL === 'string' && gatewayOriginIsValid(source.baseURL)) {
+        const baseHost = new URL(source.baseURL).host.toLowerCase()
+        if (!gatewayHostIsLoopback(source.baseURL) && !source.allowedHosts.some(host => host.trim().toLowerCase() === baseHost)) {
+          errors.push(vmsg(locale, 'gatewayQuotaHosts'))
+        }
+      }
+      if (typeof source.allowInsecureHttp !== 'boolean') errors.push(vmsg(locale, 'gatewayQuotaSource'))
+      if (typeof source.baseURL === 'string' && source.baseURL.startsWith('http:')
+        && !gatewayHostIsLoopback(source.baseURL) && source.allowInsecureHttp !== true) errors.push(vmsg(locale, 'gatewayQuotaHttp'))
     }
   }
   // OpenCode Go 订阅额度显示校验。
@@ -829,6 +1325,18 @@ export function applyConfigPatch(current, patch) {
   } else {
     for (const field of ['enabled', 'budget', 'go', 'plans', 'promptSeen']) {
       if (typeof quotaStrip[field] !== 'boolean') errors.push(vmsg(locale, 'quotaStripFlag', { field }))
+    }
+  }
+  // 进度条方向(issue #67):四组条各自 remaining / used,非法值整体报错
+  // (客户端提交完整对象,与 corner/quotaStrip 同策略)。
+  const barDirections = candidate.barDirections
+  if (barDirections === null || typeof barDirections !== 'object' || Array.isArray(barDirections)) {
+    errors.push(vmsg(locale, 'barDirections'))
+  } else {
+    for (const field of ['balance', 'budget', 'go', 'plan']) {
+      if (barDirections[field] !== 'remaining' && barDirections[field] !== 'used') {
+        errors.push(vmsg(locale, 'barDirectionValue', { field }))
+      }
     }
   }
   // Token 用量统计显示位置校验。
@@ -910,7 +1418,23 @@ export function applyConfigPatch(current, patch) {
 export function sanitizeConfig(raw) {
   const base = defaultConfig()
   const cfg = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {}
+  if (cfg.prices?.currency === 'CNY') {
+    base.prices = { ...base.prices, ...structuredClone(DEFAULT_PRICE_TABLE_CNY), currency: 'CNY' }
+  }
   const out = mergeDeep(base, cfg)
+  // 与 RPC 的完整列表替换语义一致：不能把新默认表的美元历史价混进旧人民币记录，
+  // 也不能在重启时复活用户已取消挂载的模型。升级由带标记的启动迁移完成。
+  const storedModels = cfg.prices?.models
+  if (storedModels && typeof storedModels === 'object' && !Array.isArray(storedModels)) {
+    out.prices.models = mergeDeep({}, storedModels)
+  }
+  // 新版默认价带峰谷档位；加载已有完整记录时保留用户省略/清空的档位。
+  // 旧官方默认价的补齐由带迁移标记的启动流程负责，避免每次加载覆盖自定义。
+  const storedDefault = cfg.prices?.default
+  if (storedDefault && typeof storedDefault === 'object' && !Array.isArray(storedDefault)) {
+    const { cacheHit, cacheMiss, output } = base.prices.default
+    out.prices.default = mergeDeep({ cacheHit, cacheMiss, output }, storedDefault)
+  }
   const isNum = v => typeof v === 'number' && Number.isFinite(v)
   const oneOf = (v, list, fallback) => (typeof v === 'string' && list.includes(v) ? v : fallback)
   // 顶层标量:类型不符回落默认。
@@ -920,7 +1444,10 @@ export function sanitizeConfig(raw) {
     if (t === 'boolean' && typeof v !== 'boolean') out[key] = def
     else if (t === 'number' && !isNum(v)) out[key] = def
     else if (t === 'string' && typeof v !== 'string') out[key] = def
-    else if (t === 'object' && def !== null && (v === null || typeof v !== 'object' || Array.isArray(v) !== Array.isArray(def))) out[key] = def
+    else if (t === 'object' && def !== null && v !== null && typeof v === 'object' && key === 'gatewayQuotas' && Array.isArray(v)) {
+      // 兼容旧草案的顶层数组形态:array 与 canonical { sources: [] } 的 array-ness 不同,
+      // 不能被上方的一元收敛改回默认,须留到下方 gateway 专用迁移块转成 canonical。
+    } else if (t === 'object' && def !== null && (v === null || typeof v !== 'object' || Array.isArray(v) !== Array.isArray(def))) out[key] = def
   }
   // 枚举收敛。
   out.locale = oneOf(out.locale, ['auto', 'zh', 'en'], 'auto')
@@ -939,6 +1466,20 @@ export function sanitizeConfig(raw) {
   out.hideOfficialBalance = out.hideOfficialBalance === true
   out.hideTodayCost = out.hideTodayCost === true
   out.showTotalWithPlan = out.showTotalWithPlan === true
+  out.includeSubagentCost = out.includeSubagentCost === true
+  out.codexQuotaEnabled = out.codexQuotaEnabled === true
+  out.sidebarSimple = out.sidebarSimple === true
+  out.sidebarSimplePromptSeen = out.sidebarSimplePromptSeen === true
+  out.sidebarModels = Object.fromEntries(Object.entries(base.sidebarModels).map(([k, fallback]) => {
+    const value = out.sidebarModels?.[k]
+    const choices = { period: ['today', 'history'], summary: ['total', 'top'], position: ['first', 'afterBalance', 'last'] }[k]
+    return [k, choices ? (choices.includes(value) ? value : fallback) : typeof fallback === 'boolean' ? (typeof value === 'boolean' ? value : fallback)
+      : typeof value === 'number' && Number.isFinite(value) ? Math.min(k === 'topN' ? 10 : 60, Math.max(k === 'topN' ? 1 : 10, Math.floor(value))) : fallback]
+  }))
+  out.sidebarStyle = oneOf(out.sidebarStyle, ['standard', 'compact'], 'standard')
+  out.priceMatchDismissed = Array.isArray(out.priceMatchDismissed)
+    ? [...new Set(out.priceMatchDismissed.filter(key => typeof key === 'string' && key.length > 0 && key.length <= 512))].slice(0, 1000)
+    : []
   // v1.5.38 的隐私模式字段已废弃(改为 UI 隐藏开关):清洗旧账本残留,避免僵尸配置长期留存。
   delete out.hideAmounts
   // 峰/谷切换弹窗提醒:非法值定向收敛(开关默认开、提前量回 2、类型回 both)。
@@ -998,37 +1539,80 @@ export function sanitizeConfig(raw) {
   goQuota.main = oneOf(goQuota.main, ['rolling', 'weekly', 'monthly'], 'rolling')
   goQuota.detail = goQuota.detail !== false
   const customBalance = out.customBalance ?? base.customBalance
-  customBalance.enabled = customBalance.enabled === true
-  customBalance.display = oneOf(customBalance.display, ['sidebar', 'settings', 'both', 'off'], 'both')
-  customBalance.refreshMinutes = Math.min(1440, Math.max(1, Math.floor(Number(customBalance.refreshMinutes) || 15)))
-  customBalance.label = typeof customBalance.label === 'string' ? customBalance.label : base.customBalance.label
-  customBalance.labelEn = typeof customBalance.labelEn === 'string' ? customBalance.labelEn : base.customBalance.labelEn
-  customBalance.unit = oneOf(customBalance.unit, ['USD', 'CNY', 'EUR'], base.customBalance.unit)
-  if (customBalance.request === null || typeof customBalance.request !== 'object' || Array.isArray(customBalance.request)) {
-    customBalance.request = { ...base.customBalance.request }
-  } else {
-    // 加载边界清洗:url/method 回落字符串,headers 只保留字符串→字符串(手改账本防击穿 strict codec)。
-    const cleanedHeaders = {}
-    for (const [key, value] of Object.entries(customBalance.request.headers ?? {})) {
-      if (typeof key === 'string' && typeof value === 'string') cleanedHeaders[key] = value
+  // 单条收敛(旧 customBalance 形态,加载/补丁均经此处;字段口径与数组条目一致)。
+  const sanitizeCustomEntry = (raw, baseEntry) => {
+    const entry = raw ?? {}
+    const clean = {
+      ...(entry.adapter === 'aliyun' ? { adapter: 'aliyun' } : {}),
+      enabled: entry.enabled === true,
+      display: oneOf(entry.display, ['sidebar', 'settings', 'both', 'off'], 'both'),
+      refreshMinutes: Math.min(1440, Math.max(1, Math.floor(Number(entry.refreshMinutes) || 15))),
+      label: typeof entry.label === 'string' ? entry.label : baseEntry.label,
+      labelEn: typeof entry.labelEn === 'string' ? entry.labelEn : baseEntry.labelEn,
+      unit: oneOf(entry.unit, ['USD', 'CNY', 'EUR', 'CREDITS'], baseEntry.unit),
     }
-    customBalance.request = {
-      ...base.customBalance.request,
-      ...customBalance.request,
-      url: typeof customBalance.request.url === 'string' ? customBalance.request.url : '',
-      method: typeof customBalance.request.method === 'string' ? customBalance.request.method : 'GET',
-      headers: {
-        ...(base.customBalance.request?.headers ?? {}),
-        ...cleanedHeaders,
-      },
+    if (entry.request === null || typeof entry.request !== 'object' || Array.isArray(entry.request)) {
+      clean.request = { ...baseEntry.request }
+    } else {
+      // 加载边界清洗:url/method 回落字符串,headers 只保留字符串→字符串(手改账本防击穿 strict codec)。
+      const cleanedHeaders = {}
+      for (const [key, value] of Object.entries(entry.request.headers ?? {})) {
+        if (typeof key === 'string' && typeof value === 'string') cleanedHeaders[key] = value
+      }
+      clean.request = {
+        ...baseEntry.request,
+        ...entry.request,
+        url: typeof entry.request.url === 'string' ? entry.request.url : '',
+        method: typeof entry.request.method === 'string' ? entry.request.method : 'GET',
+        headers: {
+          ...(baseEntry.request?.headers ?? {}),
+          ...cleanedHeaders,
+        },
+      }
     }
+    if (entry.extract === null || typeof entry.extract !== 'object' || Array.isArray(entry.extract)) {
+      clean.extract = { ...baseEntry.extract }
+    } else {
+      clean.extract = { ...baseEntry.extract, ...entry.extract }
+    }
+    // 凭据外带白名单(v1.6.8)随行:字符串数组,仅保留非空串。
+    if (Array.isArray(entry.allowedHosts)) {
+      const hosts = entry.allowedHosts.filter(h => typeof h === 'string' && h.length > 0)
+      if (hosts.length > 0) clean.allowedHosts = hosts
+    }
+    return clean
   }
-  if (customBalance.extract === null || typeof customBalance.extract !== 'object' || Array.isArray(customBalance.extract)) {
-    customBalance.extract = { ...base.customBalance.extract }
-  } else {
-    customBalance.extract = { ...base.customBalance.extract, ...customBalance.extract }
+  const sanitizedSingle = sanitizeCustomEntry(customBalance, base.customBalance)
+  out.customBalance = sanitizedSingle
+  // Gateway quota 配置 canonical shape：旧版本/早期草案可能存成数组，
+  // 加载时迁移到 { sources: [] }，未知字段与密钥不保留。
+  const rawGateway = out.gatewayQuotas
+  const gatewaySourcesRaw = Array.isArray(rawGateway)
+    ? rawGateway
+    : rawGateway !== null && typeof rawGateway === 'object' && Array.isArray(rawGateway.sources)
+      ? rawGateway.sources
+      : []
+  const gatewaySources = []
+  const gatewayIds = new Set()
+  for (const raw of gatewaySourcesRaw.slice(0, 4)) {
+    const source = normalizeGatewaySourceForStore(raw)
+    if (!GATEWAY_SOURCE_ID_RE.test(source.id) || gatewayIds.has(source.id) || source.type !== 'cliproxyapi' || !gatewayOriginIsValid(source.baseURL)) continue
+    gatewayIds.add(source.id)
+    gatewaySources.push(source)
   }
-  out.customBalance = customBalance
+  out.gatewayQuotas = { sources: gatewaySources }
+
+  // 多配置形态(v1.7.0,issue #79):数组为运行期真源。旧单配置有实际内容
+  // (启用或配置过 URL)时自动迁移为 entries[0],保证升级无缝;数组缺席/非法
+  // 时回落「单条迁移结果」;上限 8 条。
+  let rawEntries = out.customBalances
+  if (!Array.isArray(rawEntries)) rawEntries = []
+  const baseEntry = base.customBalances?.[0] ?? base.customBalance
+  const entries = rawEntries.slice(0, 8).map(raw => sanitizeCustomEntry(raw, baseEntry))
+  const legacyHasContent = sanitizedSingle.enabled === true
+    || (typeof sanitizedSingle.request?.url === 'string' && sanitizedSingle.request.url.length > 0)
+  if (entries.length === 0 && legacyHasContent) entries.push(sanitizedSingle)
+  out.customBalances = entries
   const corner = out.corner
   for (const key of ['enabled', 'goRolling', 'goWeekly', 'goMonthly', 'budget']) corner[key] = corner[key] === true || (corner[key] !== false && key !== 'enabled')
   // 输入框上方额度横条:enabled/promptSeen 缺省 false,budget/go/plans 缺省 true。
@@ -1036,6 +1620,15 @@ export function sanitizeConfig(raw) {
   strip.enabled = strip.enabled === true
   strip.promptSeen = strip.promptSeen === true
   for (const key of ['budget', 'go', 'plans']) strip[key] = strip[key] !== false
+  // 进度条方向(issue #67):非法值逐键回落默认(balance=remaining,其余=used)。
+  const dirs = out.barDirections !== null && typeof out.barDirections === 'object' && !Array.isArray(out.barDirections)
+    ? out.barDirections : {}
+  out.barDirections = {
+    balance: dirs.balance === 'used' ? 'used' : 'remaining',
+    budget: dirs.budget === 'remaining' ? 'remaining' : 'used',
+    go: dirs.go === 'remaining' ? 'remaining' : 'used',
+    plan: dirs.plan === 'remaining' ? 'remaining' : 'used',
+  }
   // codingPlans:逐家收敛(非法条目整家回落默认;只保留已知提供商)。
   const plans = {}
   if (out.codingPlans !== null && typeof out.codingPlans === 'object') {
@@ -1047,10 +1640,33 @@ export function sanitizeConfig(raw) {
         refreshMinutes: Math.min(1440, Math.max(1, Math.floor(Number(entry.refreshMinutes) || 15))),
         apiKey: typeof entry.apiKey === 'string' ? entry.apiKey : '',
       }
+      if (id === 'minimax') {
+        const origin = normalizeMiniMaxBaseUrl(entry.baseUrl)
+        plans[id].baseUrl = origin ?? ''
+        if (origin === null) plans[id].enabled = false // 无效磁盘配置不能悄悄向默认站点发送 Key。
+      }
       if (id === 'scnet') {
         const credits = Number(entry.planCredits)
         plans[id].planCredits = Number.isFinite(credits) && credits > 0 ? credits : 240000
         plans[id].planStart = typeof entry.planStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry.planStart) ? entry.planStart : ''
+      }
+      if (id === 'qwen') {
+        plans[id].quotaSource = entry.quotaSource === 'cli' ? 'cli' : 'local'
+        const credits = Number(entry.planCredits)
+        plans[id].planCredits = Number.isFinite(credits) && credits > 0 ? credits : 500000
+        plans[id].planStart = typeof entry.planStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry.planStart) ? entry.planStart : ''
+        const rates = entry.rates !== null && typeof entry.rates === 'object' && !Array.isArray(entry.rates) ? entry.rates : {}
+        const cleaned = {}
+        for (const [model, rate] of Object.entries(rates)) {
+          if (typeof model !== 'string' || model.length === 0 || rate === null || typeof rate !== 'object') continue
+          const num = v => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : null }
+          const input = num(rate.input)
+          const cachedInput = num(rate.cachedInput)
+          const output = num(rate.output)
+          if (input === null || cachedInput === null || output === null) continue
+          cleaned[model] = { input, cachedInput, output }
+        }
+        plans[id].rates = cleaned
       }
       if (id === 'volcengine') {
         const rawId = typeof entry.accessKeyId === 'string' ? entry.accessKeyId.trim() : ''
@@ -1080,6 +1696,195 @@ export function sanitizeConfig(raw) {
   if (goModels !== null && typeof goModels === 'object') {
     delete goModels['deepseek-v4-flash']
     delete goModels['deepseek-v4-pro']
+  }
+  return out
+}
+
+// ── 密钥字段治理(v1.6.8) ───────────────────────────────────────────
+//
+// 背景:v1.6.7 及更早把 API Key / AK-SK 直接存在 config 里(config.goQuota.apiKey、
+// config.codingPlans[id].apiKey 与 volcengine 的 accessKeyId/secretAccessKey)。config 是
+// 整个对象落盘与整个对象下发前端的,于是密钥既明文写进 ledger.json,又随 getState
+// 明文抵达浏览器——前端 type="password" 只是 UI 掩码,值本身早已发出。
+//
+// v1.6.8 起密钥一律由 DSH 凭据库托管(config 里只留空字符串占位),本模块提供:
+//   - stripSecrets()  落盘/下发前清空全部密钥字段
+//   - SECRET_TARGETS  可被凭据库托管的密钥目标清单
+//   - readSecret/writeSecret  按 target 读写 config 中的占位字段(迁移与 RPC 用)
+//   - secretRefOf()   target → credentials 引用名(取各家 credentialEnvs 首选名)
+
+/**
+ * 密钥目标 → DSH 凭据库引用名。
+ * 与 coding-plans.js 各家 credentialEnvs 的**首选名**保持一致:凭据库写的是这一个名字,
+ * 而 resolve 侧仍按整张 credentialEnvs 列表依次尝试,两者因此自然对齐。
+ * scnet 的 credentialEnvs 为空数组(纯本地 Credits 估算,不需要凭据),故不在此表中——
+ * 其遗留 apiKey 字段由 stripSecrets 直接清空。
+ */
+const SECRET_REF_MAP = {
+  goQuota: 'OPENCODE_GO_API_KEY',
+  'codingPlans.anthropic': 'ANTHROPIC_OAUTH_TOKEN',
+  'codingPlans.zai': 'ZAI_API_KEY',
+  'codingPlans.minimax': 'MINIMAX_API_KEY',
+  'codingPlans.kimi': 'KIMI_CODING_API_KEY',
+  'codingPlans.openrouter': 'OPENROUTER_API_KEY',
+  'codingPlans.siliconflow': 'SILICONFLOW_API_KEY',
+  'codingPlans.commandcode': 'COMMANDCODE_API_KEY',
+  'codingPlans.volcengine.ak': 'VOLC_ACCESSKEY',
+  'codingPlans.volcengine.sk': 'VOLC_SECRETKEY',
+}
+
+/** 可由凭据库托管的密钥目标清单(顺序即 UI 展示与迁移处理顺序)。 */
+export const SECRET_TARGETS = Object.keys(SECRET_REF_MAP)
+
+/**
+ * 目标 → 凭据库引用名;未知目标返回 null。
+ * @param {string} target
+ * @returns {string | null}
+ */
+export function secretRefOf(target) {
+  return typeof target === 'string' ? SECRET_REF_MAP[target] ?? null : null
+}
+
+/** @param {unknown} value */
+const secretText = value => (typeof value === 'string' ? value.trim() : '')
+
+/**
+ * 按 target 读取 config 中的密钥占位字段(可能已被清空为空串)。
+ * @param {unknown} cfg
+ * @param {string} target
+ */
+export function readSecret(cfg, target) {
+  if (typeof target !== 'string') return ''
+  if (target === 'goQuota') return secretText(cfg?.goQuota?.apiKey)
+  if (!target.startsWith('codingPlans.')) return ''
+  const rest = target.slice('codingPlans.'.length)
+  const entries = cfg?.codingPlans
+  if (entries === null || typeof entries !== 'object') return ''
+  if (rest.endsWith('.ak')) return secretText(entries[rest.slice(0, -3)]?.accessKeyId)
+  if (rest.endsWith('.sk')) return secretText(entries[rest.slice(0, -3)]?.secretAccessKey)
+  return secretText(entries[rest]?.apiKey)
+}
+
+/**
+ * 按 target 写入 config 中的密钥占位字段。返回新的 config(浅拷贝路径上的对象,不改原对象)。
+ * 只写**已存在**的键,避免给 scnet 这类无凭据厂商凭空造出 apiKey 字段而击穿 strict codec。
+ * @param {Record<string, unknown>} cfg
+ * @param {string} target
+ * @param {string} value
+ */
+export function writeSecret(cfg, target, value) {
+  if (cfg === null || typeof cfg !== 'object' || typeof target !== 'string') return cfg
+  const text = typeof value === 'string' ? value : ''
+  if (target === 'goQuota') {
+    const goQuota = cfg.goQuota !== null && typeof cfg.goQuota === 'object' && !Array.isArray(cfg.goQuota) ? cfg.goQuota : {}
+    if (!('apiKey' in goQuota)) return cfg
+    return { ...cfg, goQuota: { ...goQuota, apiKey: text } }
+  }
+  if (!target.startsWith('codingPlans.')) return cfg
+  const rest = target.slice('codingPlans.'.length)
+  const entries = cfg.codingPlans !== null && typeof cfg.codingPlans === 'object' && !Array.isArray(cfg.codingPlans) ? cfg.codingPlans : {}
+  if (rest.endsWith('.ak') || rest.endsWith('.sk')) {
+    const id = rest.slice(0, -3)
+    const field = rest.endsWith('.ak') ? 'accessKeyId' : 'secretAccessKey'
+    const entry = entries[id]
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry) || !(field in entry)) return cfg
+    return { ...cfg, codingPlans: { ...entries, [id]: { ...entry, [field]: text } } }
+  }
+  const entry = entries[rest]
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry) || !('apiKey' in entry)) return cfg
+  return { ...cfg, codingPlans: { ...entries, [rest]: { ...entry, apiKey: text } } }
+}
+
+// ── 自定义余额请求头密钥治理(v1.7.6,issue #86) ───────────────────────
+//
+// customBalances[].request.headers 是「普通配置头 + 密钥头」混排的字段:Authorization、
+// X-Api-Key 里放的是密钥,Content-Type / Accept 是普通配置。v1.6.8 只治理了
+// goQuota/codingPlans 的专属密钥字段,自定义余额的明文 key 会原样写进 ledger.json 并
+// 随 getState 下发浏览器。v1.7.6 起按值形态判定:{{VAR}} 占位符是安全引用照常保留,
+// 疑似明文密钥的值在落盘/下发/补丁三条路径一律置空;运行期由启动迁移把明文导入
+// DSH 凭据库并替换为 {{CUSTOM_BALANCE_KEY_xxx}} 占位符(见 index.js
+// migrateCustomBalanceHeaderSecrets),普通头不受影响。
+//
+// 判定函数 looksLikeSecretHeaderValue 自 v1.7.9 起移居 net.js(零本地依赖层):
+// v1.7.6 把它放本模块时引入了 custom-balance → store 的环边,连同既有的
+// store → plan-billing → coding-plans → custom-balance 构成 ESM 环,在 DSH
+// Desktop 的加载顺序下爆发 TDZ(Cannot access 'CODING_PLAN_PROVIDER_IDS'
+// before initialization,v1.7.8 用户实测)。本模块自身使用(脱敏三条路径)与
+// 既有「from store.js 导入」的消费方(测试/客户端)经下方 re-export 保持兼容。
+import { looksLikeSecretHeaderValue } from './net.js'
+export { looksLikeSecretHeaderValue }
+
+/**
+ * 脱敏一条自定义余额条目的请求头:疑似明文密钥的值置空,占位符与普通头原样保留。
+ * 无密钥时返回原对象(引用相等,便于上层跳过拷贝)。
+ * @param {unknown} entry
+ */
+function redactCustomBalanceEntry(entry) {
+  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return entry
+  const request = entry.request
+  if (request === null || typeof request !== 'object' || Array.isArray(request)) return entry
+  const headers = request.headers
+  if (headers === null || typeof headers !== 'object' || Array.isArray(headers)) return entry
+  let changed = false
+  const next = {}
+  for (const [name, value] of Object.entries(headers)) {
+    if (looksLikeSecretHeaderValue(name, value)) { next[name] = ''; changed = true } else next[name] = value
+  }
+  if (!changed) return entry
+  return { ...entry, request: { ...request, headers: next } }
+}
+
+/**
+ * 清空 config 中的全部密钥字段(落盘与下发前端前调用)。
+ * 只清**已存在**的键以保持字段形状不变(strict codec 对未知键敏感),空占位字符串照旧保留。
+ * v1.7.6 起同时脱敏 customBalances / 旧 customBalance 的请求头(issue #86)。
+ * @param {Record<string, unknown>} cfg
+ * @returns {Record<string, unknown>} 脱敏后的浅拷贝。
+ */
+export function stripSecrets(cfg) {
+  if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) return cfg
+  const out = { ...cfg }
+  if (out.goQuota !== null && typeof out.goQuota === 'object' && !Array.isArray(out.goQuota)) {
+    const goQuota = { ...out.goQuota }
+    if ('apiKey' in goQuota) goQuota.apiKey = ''
+    out.goQuota = goQuota
+  }
+  if (out.codingPlans !== null && typeof out.codingPlans === 'object' && !Array.isArray(out.codingPlans)) {
+    const plans = {}
+    for (const [id, entry] of Object.entries(out.codingPlans)) {
+      if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) { plans[id] = entry; continue }
+      const copy = { ...entry }
+      if ('apiKey' in copy) copy.apiKey = ''
+      if ('accessKeyId' in copy) copy.accessKeyId = ''
+      if ('secretAccessKey' in copy) copy.secretAccessKey = ''
+      plans[id] = copy
+    }
+    out.codingPlans = plans
+  }
+  if (out.customBalance !== null && typeof out.customBalance === 'object' && !Array.isArray(out.customBalance)) {
+    out.customBalance = redactCustomBalanceEntry(out.customBalance)
+  }
+  if (Array.isArray(out.customBalances)) {
+    out.customBalances = out.customBalances.map(redactCustomBalanceEntry)
+  }
+  if (Array.isArray(out.gatewayQuotas)) {
+    out.gatewayQuotas = out.gatewayQuotas.map(source => {
+      if (source === null || typeof source !== 'object' || Array.isArray(source)) return source
+      const copy = { ...source }
+      for (const key of ['managementKey', 'apiKey', 'key', 'token']) delete copy[key]
+      return copy
+    })
+  } else if (out.gatewayQuotas !== null && typeof out.gatewayQuotas === 'object') {
+    const gatewayQuotas = { ...out.gatewayQuotas }
+    if (Array.isArray(gatewayQuotas.sources)) {
+      gatewayQuotas.sources = gatewayQuotas.sources.map(source => {
+        if (source === null || typeof source !== 'object' || Array.isArray(source)) return source
+        const copy = { ...source }
+        for (const key of ['managementKey', 'apiKey', 'key', 'token']) delete copy[key]
+        return copy
+      })
+    }
+    out.gatewayQuotas = gatewayQuotas
   }
   return out
 }
@@ -1122,6 +1927,9 @@ export class Ledger {
     // 余额差对账参考点({ date, total, granted, topped, at }),由 open() 载入、flush() 落盘。
     this.balanceRef = null
     this.migrations = Array.isArray(migrations) ? migrations.filter(m => typeof m === 'string') : []
+    // 存量密钥迁移状态(v1.6.8,**不落盘**):{ ran, pending }。由 runSecretMigration 写入、
+    // buildState 读取,用于在 UI 提示未能自动导入凭据库的密钥。
+    this.secretMigration = { ran: false, pending: [] }
     // Plan 百分比采样历史与 provider×小时聚合桶(issue #64;v1.5.52 起小时桶取代环形缓冲)。
     this.planSamples = extras.planSamples ?? {}
     this.planHourBuckets = extras.planHourBuckets ?? {}
@@ -1334,7 +2142,9 @@ export class Ledger {
       const tmp = `${this.path}.tmp`
       writeFileSync(tmp, JSON.stringify({
         version: LEDGER_VERSION,
-        config: this.config,
+        // 密钥脱敏(v1.6.8):内存中 this.config 仍保留明文供运行时解析(凭据库/环境变量
+        // 都取不到时的兜底),但**绝不写盘**——ledger.json 只存空占位字符串。
+        config: stripSecrets(this.config),
         days: this.days,
         balanceRef: this.balanceRef ?? null,
         migrations: this.migrations,
@@ -1467,14 +2277,18 @@ export class Ledger {
  * 仅当余额确实减少时才对账——订阅/Coding Plan 消费不动官方余额,若强行用余额差
  * 替代今日费用会把订阅用户全天消费归零;充值/额度结构变动时重置参考点防误判;
  * 参考点与本次拉取的币种不一致时(多币种条目挑选切换/旧账本无币种标记)同样重置。
+ * 币种折算(用户实测:CNY 余额账号恒报 drift):余额差按 snap.currency 计价(开放平台
+ * 主币种为 ¥),而账本金额恒为 USD——直接相减/比阈值是跨币种错配。折算入 USD 后再比;
+ * CNY 折算率取 options.exchangeRate(非法回落 7.2 默认展示汇率),非 CNY 按 1:1。
  * @param prevRef - 上一参考点({ date, total, granted, topped, currency, at })或 null。
  * @param balance - 本次拉取结果({ currency, totalBalance, grantedBalance, toppedUpBalance })。
- * @param todayCost - 本地账本今日合计费用。
+ * @param todayCost - 本地账本今日合计费用(USD)。
  * @param dayKey - 本地日期键(YYYY-MM-DD)。
  * @param nowMs - 当前时刻。
- * @returns {{ ref, event }} event.kind ∈ baseline | structure-reset | flat | ok | drift(drift 携带 spent/todayCost)。
+ * @param [options] - { exchangeRate }:CNY→USD 折算率(1 USD 兑 X CNY)。
+ * @returns {{ ref, event }} event.kind ∈ baseline | structure-reset | flat | ok | drift(drift 携带 spent/spentCurrency/spentUsd/todayCost)。
  */
-export function reconcileBalanceDelta(prevRef, balance, todayCost, dayKey, nowMs) {
+export function reconcileBalanceDelta(prevRef, balance, todayCost, dayKey, nowMs, options) {
   if (balance === null || typeof balance !== 'object' || !Number.isFinite(balance.totalBalance)) {
     return { ref: prevRef ?? null, event: null }
   }
@@ -1499,14 +2313,26 @@ export function reconcileBalanceDelta(prevRef, balance, todayCost, dayKey, nowMs
   if (snap.granted > prevRef.granted + 0.009 || snap.topped > prevRef.topped + 0.009) {
     return { ref: snap, event: { kind: 'structure-reset' } }
   }
+  // 赠送余额当日过期(issue #89):基准时有赠送余额、当前已归零(granted > 0 → ~0),
+  // total 的当日减量里混入了整块赠送失效——这部分不是消费,与账本今日费用必然对不上,
+  // 金额越大越会把真实小额偏差淹没成「变动严重虚高」的误报。与上方「授予增加」
+  // 重置对称:归零瞬间重置基准,从零余额起继续对账。
+  if (prevRef.granted > 0.009 && snap.granted <= 0.009) {
+    return { ref: snap, event: { kind: 'structure-reset' } }
+  }
+  const isCny = snap.currency.toUpperCase() === 'CNY'
+  const fallbackRate = isCny ? 7.2 : 1
+  const configuredRate = Number(options?.exchangeRate)
+  const exchangeRate = Number.isFinite(configuredRate) && configuredRate > 0 ? configuredRate : fallbackRate
   const spent = prevRef.total - snap.total
+  const spentUsd = isCny ? spent / exchangeRate : spent
   // 余额未减少:无法对账(可能整天走订阅扣费),静默。
   if (spent <= 0.009) return { ref: prevRef, event: { kind: 'flat' } }
-  const dev = Math.abs(spent - todayCost)
-  const threshold = Math.max(0.3, 0.15 * Math.max(spent, todayCost))
-  if (dev > threshold) return { ref: prevRef, event: { kind: 'drift', spent, todayCost } }
+  const dev = Math.abs(spentUsd - todayCost)
+  const threshold = Math.max(0.3, 0.15 * Math.max(spentUsd, todayCost))
+  if (dev > threshold) return { ref: prevRef, event: { kind: 'drift', spent, spentCurrency: snap.currency, spentUsd, todayCost } }
   // ok/drift 都保留当日首次基准,后续拉取继续与早间基线比对。
-  return { ref: prevRef, event: { kind: 'ok', spent, todayCost } }
+  return { ref: prevRef, event: { kind: 'ok', spent, spentCurrency: snap.currency, spentUsd, todayCost } }
 }
 
 /**

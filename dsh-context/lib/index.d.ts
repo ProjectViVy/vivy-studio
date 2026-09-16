@@ -1,8 +1,8 @@
-import { ZodType, z } from "zod";
-import { Session, SessionEvent } from "@deepseek-ai/dsh-session";
-import { Context, Service } from "@deepseek-ai/cordis";
+import { z } from "zod";
+import "@deepseek-ai/dsh-session";
+import { Context } from "@deepseek-ai/cordis";
 //#region src/host/config.d.ts
-interface Config {
+export interface Config {
   /** Cap on kept per-step request records (the hard step backstop). */
   maxRequestSteps?: number;
   /** Newest whole-turn window kept; trimming crosses whole turns, never mid-turn. */
@@ -16,33 +16,259 @@ interface Config {
   maxNodes?: number;
   /** Removed (shadowed) surface nodes kept for per-step reconstruction. */
   maxArchiveNodes?: number;
+  /** Fold-derived file-operation records kept (the File Activity card's raw material). */
+  maxFileOps?: number;
 }
 /**
  * The cordis `Config` validator: strict on keys, defaults on the schema fields; tolerates `undefined` (a patch row without a `config:`
  * block — defaults win).
  */
-declare const Config: z.ZodPreprocess<z.ZodObject<{
+export declare const Config: z.ZodPreprocess<z.ZodObject<{
   maxRequestSteps: z.ZodDefault<z.ZodNumber>;
   maxKeptTurns: z.ZodDefault<z.ZodNumber>;
   maxEvents: z.ZodDefault<z.ZodNumber>;
   maxNodes: z.ZodDefault<z.ZodNumber>;
   maxArchiveNodes: z.ZodDefault<z.ZodNumber>;
+  maxFileOps: z.ZodDefault<z.ZodNumber>;
 }, z.core.$strict>>;
 //#endregion
-//#region src/shared/types.d.ts
+//#region src/host/activity.d.ts
+/** The persisted fold state (the registry's `stateSchema` contract). */
+interface ActivityState {
+  days: Record<string, {
+    tokens: number;
+    requests: number;
+  }>;
+}
+//#endregion
+//#region src/host/headers.d.ts
 /**
- * Shared wire contract — the snapshot model exchanged between the Host and Client halves. Delivered as the `view()` payload of the
- * `contextTimeline`/`contextHeaders` session projections (registered on `ctx.sessionProjections`; the registry pushes finished views as
- * `session/projection` frames — see host/timeline.ts). TYPE-ONLY host-side module: both halves import these as `import type`, so nothing
- * from here ever reaches the runtime bundles.
+ * One stored tool: the v1 row shape carried the producer description and the
+ * raw schema; folds since the #37 slim-down append metadata-only entries.
  */
+interface StoredHeaderTool {
+  name: string;
+  tokens: number;
+  description?: string;
+  plugin?: string;
+  schema?: unknown;
+}
+/** One stored epoch: v1 rows carried `system`; folds since carry `systemTokens`. */
+interface StoredHeaderRecord {
+  seq: number;
+  time: number;
+  system?: string;
+  systemTokens?: number;
+  tools: StoredHeaderTool[];
+}
+interface HeadersState {
+  headers: StoredHeaderRecord[];
+}
+//#endregion
+//#region src/host/logShapes.d.ts
+/**
+ * The decode bucket a stream's `block-start.blockType` names: the model's
+ * thinking, the answer text, or the tool-call arguments. Undefined for an
+ * unknown/hostile marker, whose interval then stays unattributed rather than
+ * poisoning a bucket.
+ */
+type DecodeKind = 'reasoning' | 'text' | 'toolarg';
+//#endregion
+//#region src/host/fold.d.ts
+/**
+ * History retention bounds (configurable since 0.11 — see config.ts; these
+ * are the defaults' values). The fold keeps per-STEP request records; once the
+ * newest run count exceeds `maxKeptTurns`, the timeline is trimmed to the
+ * most recent whole TURN runs (never cutting a turn in half), so turn
+ * granularity can always show the full recent turn range instead of a
+ * step-count fragment. The turn-run trim runs whenever the cap is crossed
+ * (not only when the raw step bound is), so the bounded state stays at the
+ * newest ~`maxKeptTurns` turns deterministically as a live log grows.
+ */
+interface TimelineState {
+  /** Model-visible surface, newest last. */
+  surface: SurfaceNode[];
+  sums: Record<Category, number>;
+  systemTokens: number;
+  /**
+   * The live system-prompt nodes, oldest first — a V3 log's `system/message`
+   * surface nodes, or the single entry a V0/V2 `request/header.header.system`
+   * envelope defines. `systemTokens` is the LAST entry with tokens > 0 (the
+   * harness's own "last nonempty surviving system" rule), so an empty dormant
+   * node keeps its position without clearing the prompt. Bounded by
+   * SYSTEM_NODES_MAX. ABSENT on rows folded before this field existed — the
+   * wire then serves no `systems` and the client falls back to the header
+   * epoch's own envelope figure.
+   */
+  systems?: SystemPromptNode[];
+  /**
+   * Whether `systems` was built from the V0/V2 request ENVELOPE
+   * (`header.system`) rather than from V3 `system/message` events. Only then
+   * may a system-less header CLEAR the list: its canonical V0 meaning is
+   * "this request has no system prompt", while a V3 header never carries one
+   * (its prompt lives in the message history). Absent = log-sourced, and
+   * never materialized as an `undefined`-valued property (plain-JSON
+   * precondition — see the note above `model`).
+   */
+  systemsFromHeader?: true;
+  toolsTokens: number;
+  /**
+   * The projection-cache precondition is plain JSON: a property whose value
+   * is `undefined` makes the whole checkpoint unserializable
+   * (`snapshotJsonValue` rejects it), which fails EVERY cache write for the
+   * session — including the `title` projection row that powers the session
+   * list after a restart. Optional fields therefore use absent properties
+   * (`model`/`provider`/`lastModel`/`contextWindow` are simply not set until
+   * a value is known) instead of `undefined`-valued ones. Reads via
+   * `state.model` are identical for both shapes (`undefined` on miss).
+   */
+  model?: string;
+  provider?: string;
+  lastModel?: string;
+  contextWindow?: number;
+  requests: RequestRecord[];
+  events: ContextEventRecord[];
+  /**
+   * Recently removed surface nodes (stamped COPIES carrying `gone`), in
+   * removal order. Feeds the Context browser's per-step reconstruction.
+   * Bounded two ways in trimState: capped to `maxArchiveNodes`, and pruned
+   * to removals after the oldest retained request (older removals can only
+   * serve steps the requests trim already forgot).
+   */
+  archived: SurfaceNode[];
+  /**
+   * Session-cost raw material: cumulative billed-token totals per
+   * (provider, model), split into pricing periods for DeepSeek (see
+   * SessionCostUsage / CostModelUsage). Running totals — never trimmed, so
+   * the estimate always covers the COMPLETE session log even after the
+   * request/event retention bounds cut in. Absent until a usage-reporting
+   * request with a known model folds.
+   */
+  cost?: SessionCostUsage;
+  /**
+   * Whole-session human-input tally (see Snapshot.humanInputs): every
+   * non-injection `user/message` plus every answered `ask_user_question`
+   * result. Running total — never trimmed, like `cost`/`timing`. Absent until
+   * the first human input folds.
+   */
+  humanInputs?: number;
+  /**
+   * The user's newest own message as a bounded one-line preview (the surface
+   * node's first-text line). Last-wins — a newer human input replaces it, a
+   * text-less one (images only) keeps the previous line. Additive-optional
+   * like the 0.47 fields: cached rows folded before the field existed read
+   * without it and the card just hides its preview line.
+   */
+  lastUser?: string;
+  archiveFloor?: number;
+  /**
+   * The detail collections' revision marker (see ContextTimelineDetail):
+   * bumped by every fold that mutates the request records, context events,
+   * live surface, or the removed-node archive — the slim wire head carries
+   * it so an open tab knows its fetched detail went stale. Absent until the
+   * first detail fold (undefined reads as 0; never materialize an
+   * `undefined`-valued property — the plain-JSON precondition above).
+   */
+  detailRev?: number;
+  /**
+   * Whole-session timing totals (see TimingTotals) — running sums over the
+   * COMPLETE session log, like `cost`. Absent until the first step or tool
+   * lifecycle folds in; created once and cloned-on-touch afterwards (the
+   * object is shared with the persisted previous state — see `ensure`).
+   */
+  timing?: TimingTotals;
+  /**
+   * The open step's start instant, armed by `step/start` and consumed by the
+   * `assistant/message` (TTFT/generation split) and `step/end` (wall time)
+   * that follow it; `assistant/chunk` stamps `firstToken` on the step's first
+   * token delta — absent when the stream carried none (legacy or aborted
+   * steps), which leaves that call's model time unattributed. One slot, not a
+   * map: steps are sequential in the log, so the newest `step/start` is the
+   * one those events close — a hostile interleaved log degrades to skipped
+   * durations, never to unbounded state. Same arm/remove lifecycle as
+   * `pendingShadowedSeqs`.
+   *
+   * `decode` and `block` carry the generation split (reasoning / answer text /
+   * tool arguments — see TimingTotals): a V0 log's `assistant/chunk`
+   * `block-start` markers open `block` and close the previous one into
+   * `decode`; a V2+ log carries no such events, so `decode` stays absent and
+   * `assistant/message` reads the spans off its embedded stream instead.
+   */
+  stepStart?: {
+    time: number;
+    firstToken?: number;
+    decode?: Record<DecodeKind, number>;
+    block?: {
+      kind: DecodeKind;
+      since: number;
+    };
+  };
+  /**
+   * Tool callId → the call's name, start instant, and raw arguments, armed by
+   * `tool/call` and DELETED when its `tool/result` folds in (one result per
+   * call, in log order) — the map stays at pending-call size instead of
+   * growing for the session's whole lifetime (it is persisted state,
+   * shallow-copied by every fold step). The start instant prices the call's
+   * duration into `timing.toolsMs` when the result arrives; the raw arguments
+   * feed the file-op derivation (shared/fileOps.ts) at that same moment.
+   */
+  callNames: Record<string, {
+    name: string;
+    start: number;
+    argsRaw?: string;
+  }>;
+  /**
+   * Seq list of the surface nodes the next replacement will shadow, armed by
+   * the metering event (`compaction/summary` | `compaction/prune`) and
+   * consumed by the replacement that must follow it synchronously. The
+   * producer's shadow price covers exactly these seqs — which can differ
+   * from the replacement's declared range (pruned replacement nodes keep
+   * their own seqs, beyond the range end) — so removal must follow the seqs.
+   * Absent until armed, and REMOVED (not set to `undefined`) when consumed,
+   * to keep the state plain JSON for the projection cache.
+   */
+  pendingShadowedSeqs?: number[];
+  /**
+   * The seq of the compaction/prune event that armed `pendingShadowedSeqs` —
+   * the shadowed path rewrites that event's `tokens` from the gross shadow
+   * price to the NET freed amount (removed nodes minus the synchronous
+   * replacement), so the row matches the drop the trend chart shows. Same
+   * arm/remove lifecycle as `pendingShadowedSeqs`.
+   */
+  pendingShadowEventSeq?: number;
+  /**
+   * The fold-derived file-operation log (the File Activity card's raw
+   * material, shared/fileOps.ts): one record per executed file op, appended
+   * in log order — at `tool/result` (the armed call's arguments + the
+   * result's meta) and at a run_code result's flush of its nested
+   * dispatches. Bounded by `maxFileOps`; the trim stamps `fileOpsFloor`.
+   */
+  fileOps: FileOpRecord[];
+  /** The newest dropped op's seq (the card's coverage floor for the served op log). */
+  fileOpsFloor?: number;
+  /**
+   * Nested Code-Mode ops buffered by their top run_code call id until the
+   * parent's result folds (the dispatch events land BEFORE it, and the ops'
+   * locate target is that result's seq). Flushed (and the key deleted) when
+   * the result with that callId folds; absent until the first dispatch books
+   * an op. Bounded by PENDING_CODE_OPS_MAX — a hostile log that never
+   * settles a run_code cannot grow it.
+   */
+  pendingCodeOps?: Record<string, FileOpRecord[]>;
+}
+//#endregion
+//#region src/shared/types.d.ts
 declare module '@deepseek-ai/dsh-session-projection/types' {
   interface SessionProjectionMap {
     /**
-     * The plugin's whole-value context timeline: current composition,
-     * per-request history, context events, and the model-visible surface.
-     * The Host folds it from the session log; clients receive the finished
-     * value (key absence = the plugin's host half is not composed).
+     * The plugin's context timeline: current composition, counters, and the
+     * headline anchor. Since the split generation the wire value is the SLIM
+     * head (every delivery channel — session.list rows, control baselines,
+     * push frames — carries it whole); the per-request history, context
+     * events, and the surface/archive collections ride the on-demand detail
+     * channel ({@link ContextTimelineDetail}, host/detail.ts). Channel-less
+     * hosts keep the inline generation (the collections stay in the value).
+     * Key absence = the plugin's host half is not composed.
      */
     contextTimeline: ContextTimeline;
     /**
@@ -54,11 +280,101 @@ declare module '@deepseek-ai/dsh-session-projection/types' {
      * content of a picked step (key absence = older host: tokens only).
      */
     contextHeaders: ContextHeaders;
+    /**
+     * The per-day activity ledger (billed tokens + completed requests keyed
+     * by local day) behind the Context Dashboard's heatmap — the timeline's
+     * "current snapshot" cannot draw a per-day chart, so the overview reads
+     * this off every session-list row's projection column. Tiny (one small
+     * record per day, retention-capped), so riding every list row costs
+     * nothing next to the timeline head. Key absence = older host: the
+     * heatmap degrades to its empty note.
+     */
+    contextActivity: ContextActivity;
+  }
+  interface SessionProjectionStateMap {
+    contextTimeline: TimelineState;
+    contextHeaders: HeadersState;
+    contextActivity: ActivityState;
   }
 }
-type Category = 'user' | 'inject' | 'assistant' | 'tool';
+/**
+ * The priced surface buckets. `skill` carries every skill-machinery content
+ * the harness injects (issue #66): the `<available_skills>` catalog digest,
+ * a user-explicit `/name` invocation's instructions message, and the content
+ * a `skill`-tool load returns (modeled as a tool result by the harness).
+ */
+type Category = 'user' | 'inject' | 'skill' | 'assistant' | 'tool';
+/**
+ * One live system-prompt node (Snapshot.systems) — the harness models the
+ * system prompt as a surface node, so its TEXT is fetched on demand from the
+ * event at `seq`: a V3 `system/message` event, or the V0/V2 `request/header`
+ * whose envelope carried `header.system`. `tokens` is the node's heuristic
+ * price (0 for a dormant empty node, which the harness reads as "no system
+ * prompt"); the effective figure is the LAST node with `tokens > 0`.
+ */
+interface SystemPromptNode {
+  seq: number;
+  time: number;
+  tokens: number;
+}
+/**
+ * The stats board's count figures, precomputed host-side over the RETAINED
+ * request/event records (the same set the detail payload serves). Carried by
+ * the split-generation wire head so the board — and the Agent card's
+ * per-session request tally — never need the collections themselves.
+ * `steps` doubles as the retained request-record count.
+ */
+interface TimelineCounts {
+  turns: number;
+  steps: number;
+  injects: number;
+  compactions: number;
+  prunes: number;
+}
+/**
+ * The newest retained request record's billing summary — the headline's
+ * derived-occupancy anchor (`prompt + surface movement since`), carried by
+ * the split-generation wire head so the headline never needs the request
+ * records themselves.
+ */
+interface TimelineLast {
+  seq: number;
+  total: number;
+  prompt?: number;
+}
+/** One day's ledger entry in the `contextActivity` projection. */
+interface ActivityDay {
+  /**
+   * Billed tokens folded from provider-reported usage that day (prompt-side
+   * input + cache read/write + output). Requests without a usage settlement
+   * count only toward `requests` — a fabricated 0 never understates the day.
+   */
+  tokens: number;
+  /** Completed model calls (assistant settlements) that day. */
+  requests: number;
+}
+/**
+ * The per-session daily activity ledger (`contextActivity` wire value):
+ * day key (`YYYY-MM-DD`, host-local — see shared/days.ts) → that day's
+ * billed volume, retention-capped by the fold. The Context Dashboard merges
+ * every listed session's ledger into its activity heatmap.
+ */
+interface ContextActivity {
+  days: Record<string, ActivityDay>;
+}
 interface Snapshot {
   ok: boolean;
+  /**
+   * The host's baseline-gate record, present ONLY when the running harness
+   * is below the plugin's supported baseline: the host then folds nothing
+   * and every figure in this snapshot is zero/empty. The client keeps
+   * rendering the (blank) cards and pops the upgrade gate modal naming
+   * `current` (the detected harness version) and `minimum` (the baseline).
+   */
+  unsupported?: {
+    current: string;
+    minimum: string;
+  };
   model?: string;
   provider?: string;
   contextWindow?: number;
@@ -67,22 +383,10 @@ interface Snapshot {
     tools: number;
     user: number;
     inject: number;
+    skill: number;
     assistant: number;
     tool: number;
     total: number;
-  };
-  /**
-   * Provider-anchored occupancy of the NEXT request. LEGACY since 0.11: the
-   * Host no longer folds this — the Client reads the official token-meter
-   * `contextPressure` projection key (`useProjection('contextPressure')`)
-   * instead. Kept optional for wire compatibility with older clients.
-   */
-  occupancy?: {
-    pressureTokens?: number;
-    surfaceTokens: number;
-    sampledSurfaceTokens?: number;
-    projectedTokens?: number;
-    contextWindow?: number;
   };
   /**
    * Image blocks live in the CURRENT context (user uploads plus tool-result
@@ -98,14 +402,59 @@ interface Snapshot {
    * hosts; clients treat absence as zero.
    */
   toolCalls?: number;
+  /**
+   * Whole-session human-input tally: every non-injection `user/message`
+   * (the user's own messages) plus every answered `ask_user_question`
+   * result (one per answer submission). A running total over the COMPLETE
+   * log — turns the retained window no longer holds still count. Absent
+   * from older hosts; clients treat absence as zero.
+   */
+  humanInputs?: number;
+  /**
+   * The user's newest own message as a one-line bounded preview (first text
+   * block, whitespace collapsed, ~80 chars): the session cards' footer line.
+   * Additive-optional — absent from rows folded before the field existed
+   * (older hosts, idle sessions' cached rows); clients hide the line then.
+   */
+  lastUser?: string;
+  /**
+   * Split-generation head fields — present exactly when the host serves the
+   * SLIM head (the heavy collections moved to the on-demand detail channel,
+   * host/detail.ts) and absent on the inline generation (older or
+   * channel-less hosts serve the collections in place). `detailRev` is the
+   * detail's revision marker: it bumps whenever the detail collections
+   * change, so an open tab refetches on the push alone.
+   */
+  counts?: TimelineCounts;
+  last?: TimelineLast;
+  detailRev?: number;
+  /**
+   * The per-request history / context-event collections. On the split
+   * generation these stay ABSENT from the wire value (every session.list row,
+   * control baseline, and push frame would carry them whole otherwise); the
+   * client fills them from the detail channel ({@link ContextTimelineDetail}).
+   */
   requests: RequestRecord[];
   events: ContextEventRecord[];
   /**
-   * Cumulative session-cost raw material (per-family, per-period billed
-   * token totals — see SessionCostUsage). Absent until a DeepSeek V4
-   * request reports usage.
+   * Cumulative session-cost raw material (per-provider, per-model billed
+   * token totals — see SessionCostUsage). Absent until a request with a
+   * known model reports usage.
    */
   cost?: SessionCostUsage;
+  /**
+   * Whole-session timing totals (see TimingTotals). Absent until the first
+   * step lifecycle completes in the log (older plugin builds never folded
+   * one — clients treat absence as an empty timing card).
+   */
+  timing?: TimingTotals;
+  /**
+   * The live system-prompt nodes, oldest first — the browser's per-step source
+   * for the System section. Absent when the log carried no system prompt, and
+   * on older plugin builds (the client then falls back to the header epoch's
+   * own `systemTokens`, the pre-V3 shape).
+   */
+  systems?: SystemPromptNode[];
   /**
    * The served live surface: the newest `maxNodes` tail PLUS every live inject node older than the tail (injections land first and are
    * few,
@@ -132,6 +481,98 @@ interface Snapshot {
    * nodes (the browser shows the reconstruction as approximate).
    */
   archiveFloor?: number;
+  /**
+   * The fold-derived file-operation log and its trim floor — present on the
+   * INLINE wire value (channel-less hosts) and on the detail payload
+   * (ContextTimelineDetail), absent from the slim head (they ride the detail
+   * channel there).
+   */
+  fileOps?: FileOpRecord[];
+  fileOpsFloor?: number;
+}
+/**
+ * The on-demand DETAIL payload of the split `contextTimeline` generation —
+ * the heavy collections (per-request records, context events, the served
+ * surface window, and the removed-node archive) that the slim wire head no
+ * longer carries through every delivery channel. The host serves it off the
+ * live fold state at the `/dsh-context` `detail` endpoint (host/detail.ts);
+ * `rev` mirrors the head's `detailRev` at build time and acts as the
+ * client's latest-wins cursor.
+ */
+interface ContextTimelineDetail {
+  rev: number;
+  /**
+   * The slim wire head at the SAME fold cut as the collections: the
+   * composition scalars (`current`), the window/model envelope, and the
+   * precomputed counts. Sessions listed cold (never attached since the
+   * requesting unit last changed) carry no `contextTimeline` projection row
+   * for the browser's list reads, so the Agent network card fetches this
+   * head per node to render their composition rings. The host always serves
+   * it; optional so a payload missing it still serves the collections (the
+   * detail cards) and only the ring composition degrades.
+   */
+  head?: ContextTimeline;
+  requests: RequestRecord[];
+  events: ContextEventRecord[];
+  nodes: SurfaceNode[];
+  droppedNodes: number;
+  archive: SurfaceNode[];
+  surfaceFloor?: number;
+  archiveFloor?: number;
+  /**
+   * The fold-derived file-operation log (shared/fileOps.ts): one record per
+   * executed file op, newest-retained, covering the full log (never
+   * window-bound like the client-side join derivation it replaces on this
+   * generation). Code-Mode nested dispatches book ops located on their
+   * parent run_code result (`parent`).
+   */
+  fileOps?: FileOpRecord[];
+  /** The newest dropped op's seq when the op log trimmed (coverage honesty, same family as archiveFloor). */
+  fileOpsFloor?: number;
+}
+/**
+ * One executed file operation (a settled file-tool call with a resolved
+ * target), folded host-side from the durable tool lifecycle: the call's
+ * name+arguments (`tool/call`), the result's presentation meta and error
+ * (`tool/result`), or a nested Code-Mode settle (`tool/code-dispatch`,
+ * located on its parent run_code result via `parent` + `program`).
+ *
+ * `gone` is NOT host-stamped: the client joins it from the detail's archive
+ * at render time (the op's result node leaving the live surface marks where
+ * its content is still viewable). Line deltas are estimates read off the
+ * call ARGUMENTS (an edit's old/new strings, a write's content), never off
+ * result payloads.
+ */
+interface FileOpRecord {
+  seq: number;
+  /** The op's file; for a pathless search the searched PATTERN (`pattern: true`). */
+  path: string;
+  kind: 'read' | 'write' | 'search';
+  tool: string;
+  time?: number;
+  err: boolean;
+  added: number;
+  removed: number;
+  /** What was searched for, when a search named both a path and a pattern. */
+  detail?: string;
+  /** Meta-attributed search op only: matched lines the result reported for this file. */
+  hits?: number;
+  /** Read ops only: the exact 1-based window the result meta reported, else the `limit`-argument estimate (`est: true`). */
+  read?: {
+    start: number;
+    count: number;
+  } | {
+    count: number;
+    est: true;
+  };
+  /** Nested Code-Mode op only: the run_code result node the op ran under (the locate target). */
+  parent?: number;
+  /** Nested Code-Mode op only: the run_code program's model-authored description. */
+  program?: string;
+  /** The searched-pattern marker: `path` is a pattern, not a file — display must not relativize it. */
+  pattern?: true;
+  /** Client-joined archive stamp (see the type note); absent on the wire. */
+  gone?: number;
 }
 /**
  * The `contextTimeline` projection's whole value — the same snapshot the Client has always rendered. `ok` is always `true` here (a
@@ -149,21 +590,85 @@ interface CostBucketTotals {
   cacheWrite: number;
   output: number;
 }
-/** One model family's totals split by DeepSeek's pricing period (Beijing Time). */
-interface CostFamilyUsage {
+/**
+ * One completed tool name's whole-session call tally behind the timing
+ * card's top-tools ranking (running totals, never trimmed).
+ */
+interface ToolTimingTotals {
+  calls: number;
+  ms: number;
+}
+/**
+ * Whole-session timing totals, host-folded from the durable `step/start` /
+ * `step/end` / `tool/call` / `tool/result` lifecycle plus the model call's
+ * first token (running totals over the COMPLETE session log — the same
+ * never-trimmed framing as `cost`). The first token comes from a V0
+ * `assistant/chunk` delta or from the call's own embedded stream
+ * (`assistant/message.data.stream` / `assistant/attempt.data.stream`, the
+ * V2+ settlement) — whichever the log carries, matching the harness's own
+ * session-stats fold. Durations are wall-clock milliseconds: `wallMs` sums
+ * whole steps, `ttftMs` the step-start → first-token slice (the model wait)
+ * and `genMs` the first-token → assistant-message slice (the generation) —
+ * both only over calls whose stream carried a token delta, `toolsMs` the sum
+ * of per-call tool durations (parallel calls each count, so it can overlap).
+ * Absent until the first step lifecycle completes in the log.
+ *
+ * The generation window itself splits by WHAT was being decoded, off the
+ * stream's `block-start` framing (`blockType`): `reasoningMs` (the model's
+ * thinking), `textMs` (the answer text), and `toolArgMs` (the tool-call
+ * arguments). Each marker owns the interval up to the next one (the last one
+ * up to the assistant message), so the three tile the marker span and together
+ * account for essentially all of `genMs` — the span opens at the first marker,
+ * which can sit marginally before the first token, so it is not an exact
+ * partition. They are ADDITIVE-OPTIONAL: cached projection rows written before
+ * the split carry `genMs` without them, so the card falls back to the
+ * un-split shape instead of the cache row being discarded (the
+ * stateVersion-15 rationale in host/timeline.ts).
+ */
+interface TimingTotals {
+  /** Summed wall time of completed steps (the session's active time). */
+  wallMs: number;
+  /** Summed step-start → first-token time (the model wait, TTFT). */
+  ttftMs: number;
+  /** Summed first-token → assistant-message time (the generation). */
+  genMs: number;
+  /** Reasoning-decode slice of `genMs` (the model's thinking). */
+  reasoningMs?: number;
+  /** Answer-text decode slice of `genMs`. */
+  textMs?: number;
+  /** Tool-call-argument decode slice of `genMs`. */
+  toolArgMs?: number;
+  /** Completed model calls (assistant messages folded). */
+  calls: number;
+  /** Summed per-call durations of completed tool calls. */
+  toolsMs: number;
+  /** Completed tool calls (call/result pairs folded). */
+  toolCalls: number;
+  /** Per-tool-name tallies behind the timing card's ranking (bounded). */
+  tools: Record<string, ToolTimingTotals>;
+}
+/**
+ * One billed model's cumulative totals split by pricing period. Providers
+ * without period-based pricing book everything under `peak` (the list-price
+ * period); DeepSeek splits at fold time — peak windows bill at list price,
+ * off-peak (all other hours) at half.
+ */
+interface CostModelUsage {
   peak?: CostBucketTotals;
   off?: CostBucketTotals;
 }
 /**
  * The session-cost estimate's raw material: cumulative provider-reported
- * token totals per DeepSeek V4 model family (matched on the model NAME,
- * provider-agnostic) and pricing period. The Client prices these with its
- * hardcoded list-price table in the locale's currency. Absent until a
- * deepseek-v4-flash / deepseek-v4-pro request reports usage.
+ * billed-token totals, keyed by the request envelope's DSH provider id (''
+ * when a log carries none) and then by its model id — the exact (provider,
+ * model) faces the Client's model-price book resolves (the models.dev
+ * registry, client/modelPrices.ts). Running totals per key; absent until a
+ * request with a known model reports usage.
  */
 interface SessionCostUsage {
-  flash?: CostFamilyUsage;
-  pro?: CostFamilyUsage;
+  [provider: string]: {
+    [model: string]: CostModelUsage;
+  };
 }
 /** One model-visible message on the surface, with its heuristic token price. */
 interface SurfaceNode {
@@ -181,6 +686,14 @@ interface SurfaceNode {
    */
   gone?: number;
   form?: string;
+  /**
+   * The producer identity the matching inject event names (host pricing.ts
+   * `injectionSourceName`: the plugin id, the reconciled instruction files,
+   * or the durable kind). Stamped on injection nodes alongside the event, so
+   * the browser rows label them the way the events card does; absent when the
+   * source carries no readable identity or the node predates the stamp.
+   */
+  name?: string;
   text?: string;
   tool?: string;
   err?: boolean;
@@ -201,6 +714,13 @@ interface RequestRecord {
   tool: number;
   total: number;
   prompt?: number;
+  /**
+   * Skill-machinery tokens of this request (the `skill` composition
+   * category — catalog digests, invocation instructions, `skill`-tool
+   * loads). Always written by the current fold; absent on rows folded
+   * before the category existed (read as 0).
+   */
+  skill?: number;
   /**
    * Billed cache-read (served) prompt tokens of this request — the
    * hit-rate numerator against `prompt` (input + cacheRead + cacheWrite).
@@ -241,22 +761,35 @@ interface ContextEventRecord {
   turn?: number;
   step?: number;
 }
-/** One tool schema as assembled into a request header, with its display price. */
+/** One tool of a request-header epoch, with its display price. */
 interface HeaderTool {
   name: string;
   tokens: number;
-  /** Producer-declared description (may be long; the browser truncates). */
-  description?: string;
-  /** The raw JSON schema object the model received (plain JSON). */
-  schema?: unknown;
+  /**
+   * The registering plugin's label, when attribution is known: the host's
+   * best-effort attribution (`mcp:<server>` for MCP tools, or the pinned
+   * first-party package map), or a `plugin` field carried by the raw header
+   * entry — no supported-baseline harness path writes one, but the read
+   * stays defensive for foreign/newer producers. `UNKNOWN_TOOL_SOURCE` marks
+   * a tool whose provider predates the attribution hook; absent means
+   * nothing is known and the browser shows no tag.
+   */
+  plugin?: string;
 }
 /**
- * One request-header epoch: the full system prompt and tool schemas in force from this event's seq until the next epoch.
+ * One request-header epoch's METADATA: the epoch boundaries and token prices
+ * in force from this event's seq until the next epoch. The epoch CONTENT
+ * (full system prompt text, tool descriptions/schemas) is not projected —
+ * every session.list row, control baseline, push frame, and projection-cache
+ * checkpoint would otherwise carry it per session × epoch. The client
+ * fetches one epoch's content on demand (a seq-anchored history read off
+ * `seq`) as a {@link HeaderEpochContent}.
  */
 interface HeaderRecord {
   seq: number;
   time: number;
-  system?: string;
+  /** The epoch's estimated system-prompt tokens; absent when it logged no system prompt. */
+  systemTokens?: number;
   tools: HeaderTool[];
 }
 /** The `contextHeaders` projection value: the bounded epoch list (newest last). */
@@ -264,318 +797,9 @@ interface ContextHeaders {
   headers: HeaderRecord[];
 }
 //#endregion
-//#region src/host/fold.d.ts
-/**
- * History retention bounds (configurable since 0.11 — see config.ts; these
- * are the defaults' values). The fold keeps per-STEP request records; once the
- * newest run count exceeds `maxKeptTurns`, the timeline is trimmed to the
- * most recent whole TURN runs (never cutting a turn in half), so turn
- * granularity can always show the full recent turn range instead of a
- * step-count fragment. The turn-run trim runs whenever the cap is crossed
- * (not only when the raw step bound is), so the bounded state stays at the
- * newest ~`maxKeptTurns` turns deterministically as a live log grows.
- */
-interface TimelineState {
-  /** Model-visible surface, newest last. */
-  surface: SurfaceNode[];
-  sums: Record<Category, number>;
-  systemTokens: number;
-  toolsTokens: number;
-  /**
-   * The projection-cache precondition is plain JSON: a property whose value
-   * is `undefined` makes the whole checkpoint unserializable
-   * (`snapshotJsonValue` rejects it), which fails EVERY cache write for the
-   * session — including the `title` projection row that powers the session
-   * list after a restart. Optional fields therefore use absent properties
-   * (`model`/`provider`/`lastModel`/`contextWindow` are simply not set until
-   * a value is known) instead of `undefined`-valued ones. Reads via
-   * `state.model` are identical for both shapes (`undefined` on miss).
-   */
-  model?: string;
-  provider?: string;
-  lastModel?: string;
-  contextWindow?: number;
-  requests: RequestRecord[];
-  events: ContextEventRecord[];
-  /**
-   * Recently removed surface nodes (stamped COPIES carrying `gone`), in
-   * removal order. Feeds the Context browser's per-step reconstruction.
-   * Bounded two ways in trimState: capped to `maxArchiveNodes`, and pruned
-   * to removals after the oldest retained request (older removals can only
-   * serve steps the requests trim already forgot).
-   */
-  archived: SurfaceNode[];
-  /**
-   * Session-cost raw material: cumulative billed-token totals per DeepSeek
-   * V4 model family and pricing period (see SessionCostUsage). Running
-   * totals — never trimmed, so the estimate always covers the COMPLETE
-   * session log even after the request/event retention bounds cut in.
-   * Absent until a v4-flash / v4-pro request reports usage.
-   */
-  cost?: SessionCostUsage;
-  archiveFloor?: number;
-  /**
-   * Tool callId → name, armed by `tool/call` and DELETED when its
-   * `tool/result` folds in (one result per call, in log order) — the map
-   * stays at pending-call size instead of growing for the session's whole
-   * lifetime (it is persisted state, shallow-copied by every fold step).
-   */
-  callNames: Record<string, string>;
-  /**
-   * Seq list of the surface nodes the next replacement will shadow, armed by
-   * the metering event (`compaction/summary` | `compaction/prune`) and
-   * consumed by the replacement that must follow it synchronously. The
-   * producer's shadow price covers exactly these seqs — which can differ
-   * from the replacement's declared range (pruned replacement nodes keep
-   * their own seqs, beyond the range end) — so removal must follow the seqs.
-   * Absent until armed, and REMOVED (not set to `undefined`) when consumed,
-   * to keep the state plain JSON for the projection cache.
-   */
-  pendingShadowedSeqs?: number[];
-  /**
-   * The seq of the compaction/prune event that armed `pendingShadowedSeqs` —
-   * the shadowed path rewrites that event's `tokens` from the gross shadow
-   * price to the NET freed amount (removed nodes minus the synchronous
-   * replacement), so the row matches the drop the trend chart shows. Same
-   * arm/remove lifecycle as `pendingShadowedSeqs`.
-   */
-  pendingShadowEventSeq?: number;
-}
-//#endregion
-//#region node_modules/.pnpm/@deepseek-ai+dsh-session-projection@0.1.0-rc.8_@deepseek-ai+cordis@4.0.1_@deepseek-ai+d_c0ffab70d18276fadfe75ed916313ea3/node_modules/@deepseek-ai/dsh-session-projection/lib/types/types.d.ts
-/**
- * Pure-type outlet of the session-projection Service Definition: the one projection type
- * table, importable from client aggregates without dragging the host-side
- * cordis Context merges of the package root (dsh-agent → dsh-session). Domain
- * packages may declare-merge through either the package root or this outlet —
- * re-export preserves symbol identity, so both land on the same table.
- *
- * @module @deepseek-ai/dsh-session-projection/types
- */
-/**
- * The single projection type table for the whole chain (host provider, wire
- * block, client cell, React hook). Domain packages merge their key here via
- * declaration merging; values are wire-JSON whole values. How a value is
- * rendered is the slot system's business, never this layer's.
- */
-interface SessionProjectionMap {}
-//#endregion
-//#region node_modules/.pnpm/@deepseek-ai+dsh-session-projection@0.1.0-rc.8_@deepseek-ai+cordis@4.0.1_@deepseek-ai+d_c0ffab70d18276fadfe75ed916313ea3/node_modules/@deepseek-ai/dsh-session-projection/lib/types/index.d.ts
-declare module '@deepseek-ai/cordis' {
-  interface Context {
-    sessionProjections: SessionProjectionRegistry;
-  }
-}
-/**
- * One domain's state-driven computation unit: three pure synchronous
- * functions plus declarations — never an opaque getter. The framework drives
- * `apply` on every committed session event; the domain holds no
- * subscriptions and owns only the mathematics. All three functions MUST be
- * synchronous (an async unit would tear the carriers' consistency cut) and
- * `state` MUST be plain JSON (the persisted-cache precondition).
- */
-interface ProjectionDefinition<K extends keyof SessionProjectionMap, S> {
-  /** The projection key this unit owns (its `SessionProjectionMap` entry). */
-  key: K;
-  /** Validates the wire payload (`view` output) before it leaves the host. */
-  schema: ZodType<SessionProjectionMap[K]>;
-  /**
-   * State for the empty log.
-   * @returns the initial state.
-   */
-  init(): S;
-  /**
-   * Pure transition: previous state + one committed event → next state. A
-   * unit uninterested in an event MUST return the same state reference — an
-   * unchanged reference (`Object.is`) produces zero downstream work.
-   * @param state - the state covering all prior events.
-   * @param event - the next committed session event.
-   * @returns the next state (same reference when the event is not the unit's).
-   */
-  apply(state: S, event: SessionEvent): S;
-  /**
-   * State → wire payload (the read-side projection).
-   * @param state - the current state.
-   * @returns the whole current value for this unit's key.
-   */
-  view(state: S): SessionProjectionMap[K];
-  /**
-   * Persisted-cache invalidation version: bump whenever the serialized state fields or the
-   * fold semantics change, so persisted `(sessionId, key, ver, seq, val)`
-   * rows from an older unit are discarded instead of being forward-applied
-   * into garbage. Non-negative integer.
-   */
-  stateVersion: number;
-}
-/**
- * Change-feed listener: one unit's value changed for one session. `value` is
- * the schema-validated `view` output; `seq` is the unit's watermark at
- * emission (the seq of the event that caused the change).
- */
-type ProjectionChangeListener = (session: Session, key: Extract<keyof SessionProjectionMap, string>, value: unknown, seq: number) => void;
-/**
- * One consistent read cut over every registered unit for one session.
- * `asOfSeq` is the shared watermark — the seq of the last event every value
- * reflects (`-1` for an empty log, mirroring `session/subscribed.lastSeq`).
- */
-interface ProjectionSnapshot {
-  /** Seq of the last event the values reflect; -1 for an empty log. */
-  asOfSeq: number;
-  /** Whole current value per registered key. */
-  values: Partial<SessionProjectionMap>;
-}
-/**
- * One unit's checkpoint: its internal state (plain JSON by the unit
- * contract), the seq of the last event folded into it, and the unit
- * `stateVersion` that produced it — the persisted projection-cache row
- * `(sessionId, key, ver, seq, val)` minus the two outer keys. A row is
- * never authoritative, only a fold shortcut: `restore` discards it on a
- * version mismatch or when it claims events past the stored log end.
- */
-interface ProjectionCheckpointRow {
-  /** The registering unit's `stateVersion` at fold time. */
-  ver: number;
-  /** Seq of the last event folded into `val`; -1 for the empty log. */
-  seq: number;
-  /** The unit's internal state — plain JSON per the unit contract. */
-  val: unknown;
-}
-/** Checkpoint rows keyed by projection key (one session's persisted cache value). */
-type ProjectionCheckpoint = Record<string, ProjectionCheckpointRow>;
-/**
- * `ctx.sessionProjections`: the projection unit table and its drive. The
- * service subscribes to `session/event` once; every committed event passes
- * every registered unit's `apply` (eager drive), and a changed state
- * reference notifies the change feed with the schema-validated view.
- * Cells build lazily — a unit registered after events flowed, or a session
- * older than the registry, folds `init` over the in-memory log on first
- * touch (event or read). Registration is an effect (disposer rides the
- * calling fiber): an unloaded domain plugin's key disappears from snapshots
- * and clients read it as capability absence. Domain
- * plugins register under `ctx.inject(['sessionProjections'], …)` so headless
- * assemblies without the registry stay unaffected. Registrants sharing a key
- * share one unit and are counted: the same tool package mounted in N agent
- * presets registers N times, and the key survives until the last one
- * unloads.
- */
-declare class SessionProjectionRegistry extends Service {
-  private readonly registrations;
-  private readonly listeners;
-  /**
-   * Create and install the registry as `ctx.sessionProjections`.
-   * @param ctx - Cordis context that owns the service.
-   */
-  constructor(ctx: Context);
-  /**
-   * Register one domain's unit. The registration is an effect on the calling
-   * context's fiber: disposing the fiber (or calling the returned disposer)
-   * removes the key — and the unit's cached cells — from subsequent drives
-   * and snapshots.
-   * @param definition - key, state schema, pure unit functions, and stateVersion.
-   * @returns the exact disposer that unregisters this unit.
-   */
-  register<K extends keyof SessionProjectionMap, S>(definition: ProjectionDefinition<K, S>): () => void;
-  /**
-   * Subscribe to the change feed. The registration is an effect on the
-   * calling context's fiber.
-   * @param listener - called once per unit whose state reference changed, per committed event.
-   * @returns the exact disposer that unsubscribes.
-   */
-  onChanged(listener: ProjectionChangeListener): () => void;
-  /**
-   * One consistent cut over every registered unit for one session, read from
-   * the watermark cache (missing cells fold lazily over the in-memory log).
-   * Fully synchronous — every value and `asOfSeq` reflect the same log
-   * position. Each value passes its unit's schema before leaving.
-   * @param session - the session whose projection values are read.
-   * @returns the snapshot; `values` is empty when no unit is registered.
-   */
-  snapshot(session: Session): ProjectionSnapshot;
-  /**
-   * State-level checkpoint of every registered unit for one session, read
-   * from the watermark cache (missing cells fold lazily over the in-memory
-   * log). This is the write side of the persisted projection cache: the
-   * returned rows are the `(key → {ver, seq, val})` part of the durable
-   * `(sessionId, key, ver, seq, val)`
-   * rows. Every `val` is a DETACHED structured clone — never the live
-   * cell reference: the watermark cache is this registry's authoritative
-   * mutable state, and a caller reaching the live reference could corrupt
-   * every subsequent snapshot and frame through it (plain JSON by the unit
-   * contract, so the clone is total).
-   * @param session - the session whose unit states are checkpointed.
-   * @returns one row per registered key; empty when no unit is registered.
-   */
-  checkpoint(session: Session): ProjectionCheckpoint;
-  /**
-   * The stored seq a {@link restore} tail read over `checkpoint` must start
-   * at: one event BELOW the lowest usable watermark (a row is usable when
-   * its `ver` matches the live unit's `stateVersion`; an absent or mismatched row
-   * pulls the floor to `0` — that key must refold the full log). The
-   * one-below anchor is load-bearing: the tail then proves how far the
-   * stored log still extends, so {@link restore} can detect a log that
-   * shrank below a row's watermark (crash-repair truncation) instead of
-   * serving the stale row as current — an empty tail read from the anchor
-   * yields an end below every watermark and the restore rejects for a full
-   * re-read.
-   * @param checkpoint - persisted rows for one session (possibly stale or empty).
-   * @returns the seq to hand the persistence `readFrom`, or `undefined`
-   *   when no unit is registered (no read needed — {@link restore} would
-   *   serve empty values regardless).
-   */
-  restoreFloor(checkpoint: ProjectionCheckpoint): number | undefined;
-  /**
-   * View a checkpoint's rows without any log read: for every registered
-   * unit whose row's `ver` matches, serve the schema-validated
-   * `view` of the stored state; mismatched or absent rows leave their key
-   * absent (a cold or listing consumer treats it as not-yet-available and a
-   * fuller read path refolds it). The zero-I/O rung of the read ladder —
-   * values are as stale as their rows, never wrong.
-   * @param checkpoint - persisted rows for one session (possibly stale or empty).
-   * @returns whole values per key with a usable row; empty when none.
-   */
-  viewCheckpoint(checkpoint: ProjectionCheckpoint): Partial<SessionProjectionMap>;
-  /**
-   * Cold read: fold every registered unit over a stored log suffix, seeding
-   * each from its checkpoint row when usable — the one read recipe (cached
-   * state + forward tail replay + `view`) applied without a live `Session`.
-   * Call with the events returned by a persistence
-   * `readFrom(id, restoreFloor(checkpoint))` and that same floor as
-   * `baseSeq`; the floor's one-below anchor makes the supplied end honest,
-   * so a shrunk log is detected here. A row is usable iff its
-   * `ver` matches the live unit's `stateVersion`, it does not predate `baseSeq`
-   * (`seq >= baseSeq - 1`), and it does not claim events past the
-   * supplied end (`seq <= endSeq`); an unusable row is discarded
-   * and its key refolds from `init` — which is only sound over the full
-   * log, so a discarded row with `baseSeq > 0` throws (the caller re-reads
-   * from seq 0, e.g. after a crash-repair truncation shrank the log below
-   * a row's watermark).
-   * @param checkpoint - persisted rows for one session (possibly stale or empty).
-   * @param events - the stored events with `seq >= baseSeq`, in seq order.
-   * @param baseSeq - the seq `events` starts at (its first event's seq when non-empty).
-   * @returns the snapshot cut at the supplied log end (`asOfSeq` is the last
-   *   supplied event's seq, `baseSeq - 1` for an empty tail) plus the
-   *   refreshed checkpoint rows at that cut, ready for a durable write-back.
-   */
-  restore(checkpoint: ProjectionCheckpoint, events: readonly SessionEvent[], baseSeq: number): {
-    snapshot: ProjectionSnapshot;
-    checkpoint: ProjectionCheckpoint;
-  };
-  /** Fold one unit from init over `events`, producing a cell watermarked at the last folded event. */
-  private buildCell;
-  /** Read (or lazily build, folding the full in-memory log) one unit's cell. */
-  private cellFor;
-  /** Eager drive: pass one committed event through every registered unit; notify on changed references. */
-  private drive;
-}
-//#endregion
-//#region src/host/headers.d.ts
-interface HeadersState {
-  headers: HeaderRecord[];
-}
-//#endregion
 //#region src/host/index.d.ts
-declare const name = "dsh-context";
-declare const inject: string[];
-declare function apply(ctx: Context, config: Config): void;
+export declare const name = "dsh-context";
+export declare const inject: string[];
+export declare function apply(ctx: Context, config: Config): void;
 //#endregion
-export { type Category, Config, type ContextEventRecord, type ContextHeaders, type ContextTimeline, type HeaderRecord, type HeaderTool, type HeadersState, type RequestRecord, type Snapshot, type SurfaceNode, type TimelineState, apply, inject, name };
+export type { ActivityDay, ActivityState, Category, ContextActivity, ContextEventRecord, ContextHeaders, ContextTimeline, ContextTimelineDetail, HeaderRecord, HeaderTool, HeadersState, RequestRecord, Snapshot, SurfaceNode, TimelineCounts, TimelineLast, TimelineState };

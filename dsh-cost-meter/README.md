@@ -6,7 +6,10 @@
 
 本会话费用 · 当日费用 · OpenCode Go 订阅额度显示 · 预算与已用百分比 · 官方账户余额 · 自定义 Provider 余额查询(可配任意 HTTP 端点) · 余额三段进度条 · 历史记录 · 峰谷计价时段显示(UTC 01:00–04:00、06:00–10:00 为峰时段;2026-08-23 起周末全天按谷价,显示「周末时段——全谷价」) · 峰/谷切换前弹窗与系统通知提醒(位置/提前量/提醒类型可配) · 官方价格一键同步 · 类 Codex Token 用量热图 · 多厂商多模型价格计费(内置 90+ 模型价格目录与自动匹配) · 主流 Coding Plan 额度查询与显示(Anthropic / Z.ai / MiniMax / Kimi / OpenRouter / SiliconFlow / CommandCode / SCNet / 火山方舟 九家,含 Volcano Ark AK/SK 签名) · Plan/API 双轨计费(订阅额度与按量金额分离统计,每 1% 额度与满窗的 token/等值金额估算及日/周/月曲线) · 输入框上方额度横条(预算/Go/Coding Plan 用量一条横排显示,可开关)
 
-[![version](https://img.shields.io/badge/version-1.6.2-4176E6)](https://github.com/Han-1413141/dsh-cost-meter)
+[![version](https://img.shields.io/badge/version-1.7.28-4176E6)](https://github.com/Han-1413141/dsh-cost-meter)
+
+**v1.7.28**：MiniMax 额度查询默认优先使用 `www.minimax.cn`，新增可保存的 HTTPS 查询域名；手动指定后只访问该域名，更新插件保留配置。详见[配置说明](docs/minimax-quota-endpoint.md)。
+
 [![npm](https://img.shields.io/npm/v/dsh-cost-meter?label=npm)](https://www.npmjs.com/package/dsh-cost-meter)
 [![license](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![dsh](https://img.shields.io/badge/DeepSeek%20Harness-dsh--plugin-4176E6)](https://github.com/deepseek-ai/deepseek-harness)
@@ -25,13 +28,15 @@
 
 | 功能 | 位置 | 说明 |
 |---|---|---|
+| 按模型花费卡片 | 侧栏 / 右下角 dock（可配） | 默认关闭；就地展开 Top-N、其它汇总、占比和可选 Token；支持今日 / 近 90 天、展开记忆及 Top-1 角标，见[使用说明](docs/model-cost-card.md) |
 | 本会话费用 | 输入区下方 / 会话标题栏 | 实时累计费用 + 输入/缓存/输出 token,位置可配 |
 | 官方余额 | 侧边栏顶部 / 设置页(可配) | 总余额 / 赠送 / 充值,自动刷新 + 手动刷新;可选三段进度条(蓝/橙/灰),当日段只统计官方渠道费用(不含 Coding Plan / 自定义 Provider) |
 | 自定义 Provider 余额 | 侧边栏 / 设置页(可配) | 可配置 HTTP 查询任意 Provider 余额(LiteLLM 等);中/英名称、币种、extract 规则(点路径 / 数字常量 / add / subtract / divide,divide 适配 NewApi 等 quota 端点,见下方[示例](#自定义-provider-余额配置示例newapi-模板));与 Coding Plan 同区可折叠配置 |
-| OpenCode Go 额度 | 侧边栏 / 设置页 / 右下角(dock,可配) | 滚动 5 小时 / 本周 / 本月用量百分比与重置时间,三档可分别开关,可同时显示预算已用%;Key 自动发现(DSH 凭据库 OPENCODE_GO_API_KEY / 环境变量 / opencode 登录态)或手动填写 |
-| Coding Plan 额度 | 侧边栏 / 设置页(每家可配) | 多厂商 coding plan 订阅额度查询(Anthropic Claude Pro/Max、Z.ai/智谱 GLM、MiniMax Token Plan、Kimi Code 本周/5 小时配额(无订阅 Key 时回落 PAYG 余额)、OpenRouter credits、SiliconFlow 余额、CommandCode 5h/周窗口与月度 Credits 余额、火山方舟 Volcano Ark 5h/周/月三档(需 AK/SK 管控面 HMAC 签名,需 ArkReadOnlyAccess + BillingCenterReadOnlyAccess)),各家独立启用开关、凭据、显示位置与刷新间隔(侧边栏卡片与 Go 额度同款,收起窄栏显示百分比),凭据只发往官方端点;无凭据/无订阅为中性提示;SCNet 超算互联网 Token Plan 无 API 额度端点,按官方 Credits 抵扣表由本地账本估算月度用量(无需凭据) |
+| OpenCode Go 额度 | 侧边栏 / 设置页 / 右下角(dock,可配) | 滚动 5 小时 / 本周 / 本月用量百分比与重置时间,三档可分别开关,可同时显示预算已用%;Key 自动发现(专用引用 / 官方 Go 路由 apiKeyEnv / 环境变量 / opencode 登录态)或手动填写 |
+| Coding Plan 额度 | 侧边栏 / 设置页(每家可配) | 多厂商 coding plan 订阅额度查询(Anthropic Claude Pro/Max、Z.ai/智谱 GLM、MiniMax Token Plan、Kimi Code 本周/5 小时配额(无订阅 Key 时回落 PAYG 余额)、OpenRouter credits、SiliconFlow 余额、CommandCode 5h/周窗口与月度 Credits 余额、火山方舟 Volcano Ark 5h/周/月三档(需 AK/SK 管控面 HMAC 签名,需 ArkReadOnlyAccess + BillingCenterReadOnlyAccess)),各家独立启用开关、凭据、显示位置与刷新间隔(侧边栏卡片与 Go 额度同款,收起窄栏显示百分比),默认使用官方端点，MiniMax 可[配置可信查询域名](docs/minimax-quota-endpoint.md);无凭据/无订阅为中性提示;SCNet 超算互联网 Token Plan 支持[外部控制台额度快照](docs/scnet-official-snapshot.md)，无有效快照时按官方 Credits 抵扣表由本地账本估算月度用量(无需凭据) |
 | 额度横条 | 输入框上方(显示设置可开关) | 一条横排 chips 实时显示预算已用% / Go 主窗口 / 各已启用 Coding Plan 用量窗口(短标签+迷你进度条,≥80% 预警、≥100% 超支,悬停见重置时刻);点击任意 chip 即刷新对应数据源(budget→状态、Go→Go 额度、厂商→该家全部窗口),同一厂商多窗口融合为一条 chip 分段显示;首次更新弹引导卡由用户自主决定开关;无可用数据自动隐藏 |
 | 点击立即刷新 | 侧边栏余额/额度图框 | 官方余额 / 自定义余额 / Coding Plan 图框(含窄栏收起态)点击即触发一次查询,刷新中呼吸闪烁,失败保持原值并在悬停提示说明;键盘 Enter/Space 可触发;更新后首次进入有引导提示 |
+| 简化侧栏显示 | 设置 → 费用 → 显示 | 可选开启；更新首次提示选择，压缩卡片和明细，面板高度限制为视口的 38% 且不超过 320 像素；保留金额、额度、点击刷新与悬停详情，关闭后恢复原布局。[使用说明](docs/sidebar-simple.md) |
 | 当日费用 | 侧边栏底部(设置按钮上方) | 「今日 ¥x」,悬停见调用次数与 token 明细 |
 | 预算图框 | 侧边栏底部(余额行与设置按钮之间) | 圆角方形图框:预算、已用%、进度条、今日费用与占预算%、已用/额度,≥80% 预警、≥100% 超支 |
 | 汇总卡片 | 设置页 | 今日 / 本月 / 累计费用与调用次数 |
@@ -58,7 +63,37 @@
 
 ## 自定义 Provider 余额配置示例(NewApi 模板)
 
+千问 / 阿里云资金账户余额可直接点击「添加千问 / 阿里云余额」，使用 RAM AccessKey 签名查询，显示接口返回的可用金与币种；配置步骤、所需权限及口径见[千问余额说明](docs/qianwen-balance.md)。
+
+千问 Token Plan 可在卡片内选择[官方 CLI 订阅额度](docs/qwen-cli-quota.md)，需在 DSH 主机以同一系统账号安装 CLI 并运行 `qianwen auth login`。默认保留本地估算；CLI 模式显示账号当前 Credits，不修改本地账本。
+
+千问 Token Plan 的本地 Credits 仅统计 `qwen`、`qwen-tokenplan`、`qianwen-tokenplan`、`qwen-token-plan`、`qianwen-token-plan` 订阅 provider（大小写不敏感，可带 `llm-` 前缀）；显式归类为 API 的调用不计。`qianwen` 按量 provider 即使使用相同模型名也不会计入订阅额度。自定义渠道名需使用上述订阅名称之一，模型不在抵扣表中时需补充三项费率。
+
+CLIProxyAPI 网关来源卡片可勾选「只显示 Gemini 额度」，仅影响该来源的 Antigravity 分组。默认显示全部分组；过滤后无可见额度时显示空列表，解析错误仍单独报告。
+
 自定义 Provider 余额的 `extract` 规则支持四种形式:数字常量、点路径字符串、`add`/`subtract` 多路径加减、`divide` 按 `by` 除数缩放。**`divide` 适用于 NewApi 等以 quota 整数计量的端点**(1 USD = 500000 quota,与 cc-switch 同款换算)。
+
+- **`unit: "CREDITS"`**：非货币计数端点可选 `CREDITS`，按小数精度设置显示并标明 Credits。美元花费不转换为积分，也不显示由它推算的今日积分消耗；进度条仅使用接口返回的积分上限，全局货币预算不适用。
+- **本机回环端点支持明文 HTTP**:端点主机为 `127.0.0.1` / `localhost` / `[::1]` 时允许 `http://`(流量不出网卡),用于只监听回环、不提供 TLS 的本地只读路由(如 `dsh-workbuddy-connect` 的 `/plugins/dsh-workbuddy-connect/status`)。**非回环主机仍强制 https**,明文请求一律拒绝。
+
+### WorkBuddy 积分示例(本机插件路由)
+
+已安装 `dsh-workbuddy-connect` 时,其 Web 状态路由直接返回聚合积分,无需复制任何凭据:
+
+```json
+{
+  "enabled": true,
+  "display": "sidebar",
+  "refreshMinutes": 15,
+  "label": "WorkBuddy 积分",
+  "labelEn": "WorkBuddy Credits",
+  "unit": "CREDITS",
+  "request": { "url": "http://127.0.0.1:3080/plugins/dsh-workbuddy-connect/status", "method": "GET", "headers": {} },
+  "extract": { "remaining": "credits.total" }
+}
+```
+
+端口和响应字段按实际本机服务调整。该示例要求对应插件已提供此路由；本插件拒绝跟随重定向，现有凭据主机白名单继续生效。
 
 以 NewApi 的 `GET /api/usage/token` 为例(响应 `{ "code": 200, "data": { "total_granted": ..., "total_used": ..., "total_available": ..., "unlimited_quota": false } }`):
 
@@ -87,6 +122,28 @@
 - `{{NEWAPI_API_KEY}}` 从 DSH 凭据库或环境变量解析(**仅请求头支持占位符**,URL 需写死完整地址);
 - 无限额度 token(`unlimited_quota: true`)没有 `total_available`,无法提取 `remaining`,查询会报「remaining is missing or not numeric」——请改用有限额度 token,或在中间层端点换算;
 - 配置入口:设置 → 费用(额度标签)→「自定义 Provider 余额」展开配置;或直接改 `storages/cost-meter/ledger.json` 的 `config.customBalance`。
+
+### 凭据与安全
+
+- **变量名命名规则**:`{{VAR_NAME}}` 的参考格式为 `<ROUTE>_API_KEY`——`<ROUTE>` 对应 DSH 模型配置页(设置 → 模型)里的 Provider ID,把 ID 大写、非字母数字字符替换为下划线,例如 `openai`→`{{OPENAI_API_KEY}}`、`anthropic`→`{{ANTHROPIC_API_KEY}}`、`abc23-d`→`{{ABC23_D_API_KEY}}`。与模型页共用同一变量名,自定义余额查询与模型调用即**共用同一把密钥**(都从 DSH 凭据库解析)。该说明也展示在设置页「请求头 (JSON)」输入框上方。
+- **凭据输入框**:展开条目配置后,「凭据输入」区会为请求头里出现的每个 `{{VAR}}` 占位符显示一行 write-only 输入框,密钥直接存入 DSH 凭据库(不落盘、不回显、不经 `ledger.json`),无需再手改环境变量或凭据文件。
+- **明文密钥自动迁移**:旧版本把 `Bearer sk-…` 明文写在请求头里时会明文落盘;插件在启动时自动把这类明文导入 DSH 凭据库,并把头值替换为 `{{CUSTOM_BALANCE_KEY_…}}` 占位符(名称由条目 host + 头名派生,跨重启稳定),功能不受影响。此后 `ledger.json` 与下发给浏览器的配置**永不包含明文密钥**——疑似密钥头(Authorization / X-Api-Key / Bearer / sk- 前缀 / 长不透明串)一律置空,占位符与普通头照常保留。
+- **凭据白名单 `allowedHosts`**:请求头携带密钥(占位符或明文)时,出站主机必须命中该白名单,否则直接拒绝——用于防止「导入他人配置」导致密钥外带。未配置白名单时放行并在日志警告一次。设置页条目面板内有「凭据白名单主机」输入框(逗号分隔)。
+- **混合凭据模板**：同一头值同时含静态密钥与动态占位符时，不能自动整体迁移为嵌套凭据。插件提示待处理并阻止该值落盘、下发；请将静态部分另存为凭据，改用纯引用组合。正常的 `Bearer {{VAR}}` 或 `{{USER}}:{{PASS}}` 保留。
+
+## CLIProxyAPI 网关额度与 WorkBuddy 积分 (Issue #87)
+
+支持对接本地或局域网部署的 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI) 代理网关,集中观测代理的多个 Provider 账号额度与 WorkBuddy 插件积分:
+
+- **多 Provider 账号原生适配**:自动通过 CPA Management API 发现账号,接入 Antigravity、Claude、Codex、Kimi、xAI (Grok) 官方原生配额/用量接口。统一归一化为 5h / 7d / weekly / monthly 等用量百分比窗口与 ISO 重置时刻。
+- **WorkBuddy 插件积分**:只读接入 WorkBuddy 插件 `/v0/management/plugins/workbuddy/credits` 路由,展示账户总积分、已用/剩余与套餐周期,保留独立账号卡片。
+- **零计费副作用保证**:严禁并杜绝任何产生计费消耗的操作——不调用 Codex 的 reset-credit consume 端点,不向 xAI 发送消耗 token 的 chat probe,不调用 WorkBuddy 的任何变更性 POST 路由。
+- **严格凭据隔离与安全门禁**:
+  - Management Key 通过只写 (write-only) 形式托管于 DSH 凭据库 (`CLIPROXYAPI_MANAGEMENT_KEY_<SOURCE_ID>_<HASH>`),永不存入配置文件、账本或浏览器 state。
+  - 请求路径严格限制为三条固定管理路径 (`/v0/management/auth-files`、`/v0/management/api-call`、`/v0/management/plugins/workbuddy/credits`),禁止任意 URL 拼接。
+  - 严格出站白名单 (`allowedHosts`):非 loopback 来源必须精确命中白名单,非 loopback HTTP 必须显式开启 `allowInsecureHttp`。
+  - 强制禁止 HTTP 重定向 (`redirect: 'manual'`, 3xx 状态码坚决拒绝),防止网关重定向劫持或凭据外带。
+  - 账号隐私与元数据过滤:auth-files 响应仅提取必需字段,剔除 raw tokens / cookies / ID claims,展示层邮箱自动脱敏掩码 (`s***@domain`)。
 
 ## 双语界面
 
@@ -233,22 +290,22 @@
 dsh plugin --profile web add dsh-cost-meter
 ```
 
-**PowerShell 一键脚本**(复制整行粘贴回车;自动补齐 pnpm、自动探测 git,无需克隆仓库;安装链**固定到发布 tag `v1.6.2`**,建议先下载审阅再运行):
+**PowerShell 一键脚本**(复制整行粘贴回车;自动补齐 pnpm、自动探测 git,无需克隆仓库;安装链**固定到发布 tag `v1.7.28`**,建议先下载审阅再运行):
 
 ```powershell
-irm https://raw.githubusercontent.com/Han-1413141/dsh-cost-meter/v1.6.2/install.ps1 | iex
+irm https://raw.githubusercontent.com/Han-1413141/dsh-cost-meter/v1.7.28/install.ps1 | iex
 ```
 
 **或直接命令行**(机器上需已有 pnpm 与 git;同样固定到 tag):
 
 ```sh
-dsh plugin --profile web add github:Han-1413141/dsh-cost-meter#v1.6.2
+dsh plugin --profile web add github:Han-1413141/dsh-cost-meter#v1.7.28
 ```
 
 没有 git 时可用 GitHub tag 打包直链:
 
 ```sh
-dsh plugin --profile web add https://github.com/Han-1413141/dsh-cost-meter/archive/refs/tags/v1.6.2.tar.gz
+dsh plugin --profile web add https://github.com/Han-1413141/dsh-cost-meter/archive/refs/tags/v1.7.28.tar.gz
 ```
 
 安装后**重启** `dsh web`(插件行、Typert 清单与客户端 bundle 均在启动时扫描):
@@ -256,6 +313,24 @@ dsh plugin --profile web add https://github.com/Han-1413141/dsh-cost-meter/archi
 ```sh
 dsh web
 ```
+
+### 安装排障:ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION
+
+症状:`dsh plugin --profile web add` 阶段安装失败,pnpm 报 `[ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION] N lockfile entries failed verification`。
+
+原因:你的环境(pnpm 配置或上层安装器自带策略)启用了「最小发布年龄」供应链保护——lockfile 中**发布时间距今小于阈值**的包一律拒绝。插件引入依赖精确锁版之前的历史版本,生产依赖是浮动区间,首次安装会解析到当时最新发布版(实测 `^0.1.0-rc.6` 漂到仅发布一周左右的 rc.8),在该策略下即被拒绝。
+
+处理:
+
+1. **升级插件并使用宿主插件安装器**:独立运行依赖 `zod` 保持精确锁版；`@deepseek-ai/dsh-credentials`、`@deepseek-ai/dsh-home-paths` 改由宿主通过 peer dependency 提供，避免另装旧版宿主包触发依赖预检（issue #106）。精确锁版能防止版本漂移，但不能保证满足任意年龄阈值；
+2. 若仍出现年龄限制，可等待该版本达到阈值，或在核实报错中的具体包与版本后，由你决定是否在 profile 的 `pnpm-workspace.yaml`（默认 `$DSH_HOME/profiles/web/pnpm-workspace.yaml`）加入单项排除:
+
+```yaml
+minimumReleaseAgeExclude:
+  - '<报错中的包名>@<版本>'
+```
+
+宿主适配验证覆盖 DSH `0.1.2-rc.1`、`0.1.3-alpha.2`、`0.1.5-alpha.1` 的安装、启动、模块复用和卸载；`0.1.3-alpha.1` 在此前核查中无可获取的官方 npm 版本，暂标记为未知。验证环境及边界见[兼容记录](docs/host-compatibility.md)。
 
 ### 更新 / 卸载
 
@@ -283,17 +358,23 @@ dsh plugin --profile web add link:./dsh-cost-meter  # 符号链接,改 lib/clien
 - **历史计费正确性**:2026-08-16 16:00 UTC(峰谷时代分界)之前的调用按当时的基础价计费,之后的调用按峰谷两档;
 - 账本金额恒以**美元**存储,币种/汇率仅影响显示(默认 1 USD = 7.2 CNY,可改);
 - 会话徽章与当日/月度/累计、预算一样,按每次调用的**实际时刻精确计费**(宿主导出的逐次成本);
-- 计费来源为每次模型调用的 usage 块(含子代理、压缩、标题等辅助调用),与账单口径一致;
+- 计费来源为通过宿主 `llm/stream` 上报的 usage 块，包含隔离 LLM 服务中的子代理、压缩、标题等辅助调用。子会话按自己的 `sessionId` 记录，不并入父会话徽章；无 `sessionId` 的后台调用只计入日/月/累计总额。记忆等插件若直接请求外部 API、未向宿主上报 usage，本插件无法统计该部分消耗；
+- **峰谷档位按请求发起时刻判定**:流式调用可能跨峰谷边界整点,以完成时刻归档会把数分钟前发起的请求算进另一个峰位;
+- **峰谷生效时刻锚定**:官方价格页已不再标注生效时间,价格同步不再把峰谷生效时刻重置为「同步时刻」——历史重算(会话投影回放 / 按模型回填)一律按 2026-08-16 16:00 UTC 分界判档,峰时历史事件不再被按谷价半价重算;此前被污染的存量账本升级时自动钳制修复(幂等迁移);
+- **币种切换即全量换基准**:「价格币种」切换并同步后,历史账目按新价目在后台整体重算(会话日志覆盖完整的日子整体替换,日志已清理的会话保持原口径),历史与官方账单同基准,完成后有提示;升级到本版时,此前切换过币种而新旧口径并存的存量账本自动重算一次;
+- **官方账单对齐口径**:① 与官方实时数字存在**分钟级时差**属预期——账本 2 秒防抖落盘,关停瞬间仍在途的流会被服务端照常扣费而 usage 块无人接收(缺口集中在缓存命中列);② reasoning tokens 由 API 单独上报且**不计费**,token 列为五桶合计,与官方「三列」天然对不齐,**对账请以金额为准**;③ 「价格币种」设为人民币时按官方 CNY 价目直计入账,与人民币账单币种一致(CNY 计价账号推荐);设为 USD 时显示金额经固定汇率折算,与 CNY 直计存在结构性细差(两套价目比值非均匀);
 - 预算与超支提示**仅提醒,不阻止调用**。
 - **Plan/API 双轨计费**(issue #64):订阅制渠道(MiniMax / Codex 手动标记等)的调用金额只记「等值」,预算/今日费用/概览卡片等金额展示仅统计按量计费(API)部分;
 - **「含 Plan 总额」开关**:概览页汇总卡片下的快捷开关切换全部金额展示口径——关闭时仅计真金白银(API 渠道),开启后显示含 Plan 等值的总金额;网关路由(provider 缺失)调用的第三方目录模型自动归入对应订阅归类,无模型明细的历史残差计入 API 口径;设置 → 用量 的 Token Plan 统计面板提供每 1% 额度与满窗的 token/等值金额估算与日/周/月曲线;分类可在配置中按厂商或 provider:model 级覆盖。
-- **全仓安全审计修复(v1.6.2)**:账本退出丢写(close/flush 次序)、发版脚本命令注入、面板空指针崩溃(Go 月窗空值)3 项高危,及路由调用小时桶漏记、官方余额对账告警失效、自定义余额提取失败误显 $0、计费流中断泄漏等 30 余项中低危问题全量修复;账本损坏自动备份、写失败重试、配置补丁原子性、原型链与凭据处理加固。逐项清单见 [docs/security-audit-v1.6.2.md](docs/security-audit-v1.6.2.md)。
+- **全仓安全审计修复**:账本退出丢写(close/flush 次序)、发版脚本命令注入、面板空指针崩溃(Go 月窗空值)3 项高危,及路由调用小时桶漏记、官方余额对账告警失效、自定义余额提取失败误显 $0、计费流中断泄漏等 30 余项中低危问题全量修复;账本损坏自动备份、写失败重试、配置补丁原子性、原型链与凭据处理加固。逐项清单见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 数据存储
 
 - 账本:`$DSH_HOME/storages/cost-meter/ledger.json`(原子写入 + 2 秒防抖;按 `historyDays` 保留,每日最多 200 个会话明细);
+- **API Key 不落盘**:所有密钥(OpenCode Go Key、各 Coding Plan Key、火山 AK/SK)只存入 DSH 凭据库,账本文件与设置页回传均不含明文;设置页输入框为 write-only,保存后不可回显;
 - 所有设置修改**即时自动保存**(600ms 防抖),无需手动保存;
-- 删除账本文件即可清零,或使用设置页「清除全部历史」。
+- 删除账本文件即可清零,或使用设置页「清除全部历史」;
+- 隐私边界:余额/额度类端点(官方余额与各 Coding Plan)**仅在用户显式启用对应 Provider 时**才会出站请求,未启用不产生任何网络流量。
 
 ## 架构
 
@@ -356,7 +437,7 @@ dsh --profile web --port 3099                           # 真机启动(观察启
 
 - 历史按模型回填依赖宿主会话日志仍在盘:日志已被清理的早期调用无法逐模型重建,只能以「未分模型」残差行计入当日合计;
 - 官方页面解析依赖当前页面结构;改版后「从官方文档同步价格」会报错,可手动编辑价格表兜底;
-- 会话徽章按当前价格档位估算,精确费用以账本为准;
+- 会话徽章在账本数据不可用时的回退估算按「当前时刻」的价格档位给该会话全部调用定价(含 Plan 类会话):跨峰谷时段的会话在峰时会高估其谷时部分,精确费用以账本为准(账本按每次调用的发起时刻逐笔计价);
 - 价格同步会覆盖官方页面列出的同名模型价格,自定义模型条目不受影响;
 - 余额查询需要可访问 api.deepseek.com 的网络与有效 API Key;**API Key 只会发往官方域名**(baseURL 指向非官方域名时余额查询拒绝请求,模型请求不受影响);
 - OpenCode Go 额度接口为 opencode.ai 官方端点(社区文档);接口结构变化时设置页会显示错误,可在显示设置中关闭该显示;

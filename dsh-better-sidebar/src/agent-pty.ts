@@ -13,7 +13,7 @@
  */
 import { randomUUID } from 'node:crypto'
 import type { IPty } from 'node-pty'
-import { ensureSpawnHelper, shellSpawnArgs } from './pty-manager.ts'
+import { ensureSpawnHelper, resolveShellExecutable, shellSpawnArgs } from './pty-manager.ts'
 import { loadRequiredNodePty, type NodePtyModule } from './pty-deps.ts'
 import { SidebarError } from './wire.ts'
 
@@ -41,6 +41,79 @@ export function clampDims(cols: number, rows: number): { cols: number; rows: num
 }
 
 /**
+ * Per-pty Windows resize-gate state (see {@link armPtyResizeGate}).
+ */
+interface ResizeGateState {
+  /** Whether the pty has produced any output yet (ConPTY flush completed). */
+  sawData: boolean
+  /** Latest dims requested before the first output; replayed once it arrives. */
+  pending?: { cols: number; rows: number }
+}
+
+/**
+ * node-pty's Windows terminal queues resize calls that arrive before the
+ * ConPTY control socket's first data flush (`_deferNoArgs` in
+ * windowsTerminal.js). If the pty exits before the queue flushes, the
+ * deferred resize throws inside the socket's 'data' handler — uncatchable
+ * by any caller and fatal to the host process. POSIX terminals have no such
+ * queue (resize is synchronous), so the gate is armed on Windows only:
+ * {@link tryResizePty} parks dims requested before the first output and
+ * replays them after the flush, when node-pty executes resizes
+ * synchronously (and the throw for an exited pty is catchable).
+ */
+const ptyResizeGates = new WeakMap<object, ResizeGateState>()
+
+/**
+ * Arm the Windows pre-ready resize gate for one freshly spawned pty.
+ * No-op on POSIX and for injected ptys without `onData`.
+ */
+export function armPtyResizeGate(pty: IPty): void {
+  if (process.platform !== 'win32') return
+  if (typeof pty.onData !== 'function' || ptyResizeGates.has(pty)) return
+  const state: ResizeGateState = { sawData: false }
+  ptyResizeGates.set(pty, state)
+  pty.onData(() => {
+    if (state.sawData) return
+    state.sawData = true
+    const dims = state.pending
+    state.pending = undefined
+    if (dims === undefined) return
+    // node-pty's deferred flush shares this very 'data' dispatch; hop past
+    // it so the replayed resize executes synchronously (catchable) instead
+    // of being queued into the same deferred list we are draining.
+    setImmediate(() => { tryResizePty(pty, dims.cols, dims.rows) })
+  })
+}
+
+/**
+ * Best-effort resize for WebSocket-driven terminal views. Layout animation
+ * can briefly produce unusable dimensions, and node-pty can reject a resize
+ * after the socket setup's outer try/catch has returned. Ignore that one
+ * frame so the host stays alive and a later valid measurement can retry.
+ * Returns whether node-pty accepted the resize (or parked it for replay on
+ * the first output — the Windows pre-ready window).
+ */
+export function tryResizePty(
+  pty: Pick<IPty, 'resize'>,
+  cols: number,
+  rows: number,
+): boolean {
+  if (!Number.isFinite(cols) || !Number.isFinite(rows)) return false
+  const dims = clampDims(cols, rows)
+  const gate = ptyResizeGates.get(pty)
+  if (gate !== undefined && !gate.sawData) {
+    gate.pending = dims
+    return true
+  }
+  try {
+    pty.resize(dims.cols, dims.rows)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
  * Serializable snapshot of one agent terminal — the shape the model sees
  * through `terminal_list` and the sidebar sees through the push endpoint.
  * Carries no pty reference and no transcript (those are reached through
@@ -61,6 +134,13 @@ export interface AgentTerminalSnapshot {
   exitCode?: number | null
   /** Exit signal name if the process was killed by a signal; null otherwise. */
   exitSignal?: string | null
+
+  /**
+   * The model's active `terminal_wait_for` on this terminal (the sidebar
+   * renders the wait banner from it). Present only while a wait is
+   * registered; carries the LATEST wait when several overlap.
+   */
+  waiting?: { needle: string; since: number }
 }
 
 /** Map a POSIX signal number to its conventional name (best-effort). */
@@ -76,22 +156,56 @@ function signalNameOf(signal: number | null | undefined): string | null {
   return SIGNAL_NAMES[signal] ?? `signal ${signal}`
 }
 
-/** Locate the first occurrence of `needle` in `transcript`, returning its line/column. */
-function locateNeedle(transcript: string, needle: string): { line: number; column: number } | undefined {
+/**
+ * Compile a wait needle into a RegExp. The needle is treated as a JavaScript
+ * regular expression; a pattern that fails to compile ( e.g. an unbalanced
+ * group typed as a literal ) degrades to verbatim substring matching so
+ * legacy literal needles keep working.
+ */
+function compileNeedle(needle: string): RegExp | null {
+  try {
+    return new RegExp(needle)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Locate the first occurrence of `needle` in `transcript`, returning its
+ * line/column plus the actual matched text — for alternation patterns
+ * ( e.g. `(BUILD_OK|BUILD_FAIL)` ) the match tells which alternative hit.
+ * `re` is the precompiled form of `needle` (from {@link compileNeedle});
+ * `null` means verbatim substring matching.
+ */
+function locateNeedle(
+  transcript: string,
+  needle: string,
+  re: RegExp | null,
+): { line: number; column: number; match: string } | undefined {
   if (needle === '') return undefined
-  const idx = transcript.indexOf(needle)
-  if (idx === -1) return undefined
+  // Regex hit → use the match index/text; literal fallback → indexOf with
+  // the needle itself as the matched text.
+  let hit: { index: number; text: string } | undefined
+  if (re !== null) {
+    re.lastIndex = 0
+    const m = re.exec(transcript)
+    hit = m === null ? undefined : { index: m.index, text: m[0] }
+  } else {
+    const idx = transcript.indexOf(needle)
+    hit = idx === -1 ? undefined : { index: idx, text: needle }
+  }
+  if (hit === undefined) return undefined
   // Walk the transcript up to the match index, counting newlines to derive
   // the 0-based line; the column is the offset within that line.
   let line = 0
   let lineStart = 0
-  for (let i = 0; i < idx; i += 1) {
+  for (let i = 0; i < hit.index; i += 1) {
     if (transcript.charCodeAt(i) === 0x0a /* \n */) {
       line += 1
       lineStart = i + 1
     }
   }
-  return { line, column: idx - lineStart }
+  return { line, column: hit.index - lineStart, match: hit.text }
 }
 
 /** One live agent terminal. */
@@ -116,6 +230,8 @@ export interface AgentTerminalHandle {
   exitCode?: number | null
   /** Exit signal number once known (POSIX only; undefined on Windows). */
   exitSignal?: number | null
+  /** Active wait_for registrations (skip bookkeeping; empty while idle). */
+  waits: AgentTerminalActiveWait[]
 }
 
 /** Read result shape (mirrors the official tool-pty terminal_read contract). */
@@ -130,17 +246,32 @@ export interface AgentTerminalReadResult {
   lineEnd: number
 }
 
+/** One active wait_for registration on a handle (banner + skip bookkeeping). */
+export interface AgentTerminalActiveWait {
+  /** The needle being awaited (shown on the sidebar wait banner). */
+  needle: string
+  /** Epoch ms when the wait registered (age display / debugging). */
+  since: number
+  /** Flipped by `skipWait()`; the waiting poll returns `skipped` within one tick. */
+  skipped: boolean
+}
+
 /** Outcome of {@link AgentPtyRegistry.waitFor}. */
 export type AgentTerminalWaitResult =
   | {
     /** The needle was found in the transcript. */
     kind: 'found'
-    /** The matched substring. */
+    /** The pattern that was awaited. */
     needle: string
     /** 0-based line index (in the retained transcript) where the needle first appeared. */
     line: number
     /** 0-based column index within that line where the match starts. */
     column: number
+    /**
+     * The text that actually matched — for multi-outcome patterns
+     * ( e.g. `(BUILD_OK|BUILD_FAIL)` ) this tells which alternative matched.
+     */
+    match: string
     /** Elapsed wall-clock milliseconds from the wait start to the match. */
     elapsedMs: number
   }
@@ -164,6 +295,12 @@ export type AgentTerminalWaitResult =
     /** The exit signal name, if the process was killed by a signal. */
     exitSignal?: string | null
   }
+  | {
+    /** The user skipped the wait from the sidebar banner. */
+    kind: 'skipped'
+    /** The needle that was awaited. */
+    needle: string
+  }
 
 /** Snapshot projection of a handle (drops the pty reference and transcript). */
 export function snapshotOf(handle: AgentTerminalHandle): AgentTerminalSnapshot {
@@ -177,6 +314,8 @@ export function snapshotOf(handle: AgentTerminalHandle): AgentTerminalSnapshot {
     out.exitCode = handle.exitCode ?? null
     out.exitSignal = signalNameOf(handle.exitSignal)
   }
+  const active = handle.waits.at(-1)
+  if (active !== undefined) out.waiting = { needle: active.needle, since: active.since }
   return out
 }
 
@@ -219,13 +358,15 @@ export class AgentPtyRegistry {
   ): string {
     const uuid = randomUUID()
     const dims = clampDims(cols, rows)
-    const pty = this.nodePty.spawn(shell ?? this.shell, shellSpawnArgs(shellArgs ?? this.shellArgs), {
+    const executable = resolveShellExecutable(shell ?? this.shell)
+    const pty = this.nodePty.spawn(executable, shellSpawnArgs(shellArgs ?? this.shellArgs), {
       name: 'xterm-256color',
       cols: dims.cols,
       rows: dims.rows,
       cwd,
       env: { ...process.env },
     })
+    armPtyResizeGate(pty)
     const handle: AgentTerminalHandle = {
       uuid,
       sessionId,
@@ -235,6 +376,7 @@ export class AgentPtyRegistry {
       pty,
       transcript: '',
       exited: false,
+      waits: [],
     }
     pty.onData((data) => {
       handle.transcript += data
@@ -353,7 +495,11 @@ export class AgentPtyRegistry {
   resize(uuid: string, cols: number, rows: number): { cols: number; rows: number } {
     const handle = this.expect(uuid)
     const dims = clampDims(cols, rows)
-    if (!handle.exited) handle.pty.resize(dims.cols, dims.rows)
+    // Through tryResizePty: node-pty throws on a just-exited pty (the exit
+    // event may not have flipped `handle.exited` yet), and on Windows a
+    // pre-ready resize must go through the gate instead of node-pty's own
+    // deferred queue (which flushes uncatchably inside its socket handler).
+    if (!handle.exited) tryResizePty(handle.pty, dims.cols, dims.rows)
     return dims
   }
 
@@ -377,10 +523,16 @@ export class AgentPtyRegistry {
    * make event-driven wakeups unreliable. A 50ms poll is fast enough for
    * interactive use and simple enough to be obviously correct.
    * @param uuid - terminal to watch.
-   * @param needle - substring to search for (case-sensitive, verbatim).
+   * @param needle - JavaScript regular expression to search for
+   *   (case-sensitive); a pattern that fails to compile falls back to
+   *   verbatim substring matching. May cover several outcomes at once
+   *   ( e.g. `(BUILD_OK|BUILD_FAIL)` for build success vs failure ) — the
+   *   returned `match` reports the text that actually matched, so callers
+   *   can tell which outcome hit.
    * @param timeoutMs - max wait; default 10000 (10s). Clamped to ≥100ms.
    * @param signal - caller-owned cancellation; aborts the wait re-throwing.
-   * @returns one of `found` / `timeout` / `exited`.
+   * A wait can also be skipped by the user from the sidebar banner (`skipWait`), which resolves it with `{kind:'skipped'}`.
+   * @returns one of `found` / `timeout` / `exited` / `skipped`.
    */
   async waitFor(
     uuid: string,
@@ -395,37 +547,80 @@ export class AgentPtyRegistry {
     const timeout = Math.max(100, Math.floor(timeoutMs))
     const start = Date.now()
     const deadline = start + timeout
+    // Compile the needle once (regex semantics; invalid patterns degrade to
+    // verbatim matching) and reuse the compiled form across every poll.
+    const re = compileNeedle(needle)
     // Fast path: already exited, or the needle is already in the transcript
     // (a `terminal_send` may have produced the expected output before this
     // call even started).
     if (handle.exited) {
       return { kind: 'exited', needle, exitCode: handle.exitCode ?? null, exitSignal: signalNameOf(handle.exitSignal) }
     }
-    const firstHit = locateNeedle(handle.transcript, needle)
+    const firstHit = locateNeedle(handle.transcript, needle, re)
     if (firstHit !== undefined) {
-      return { kind: 'found', needle, line: firstHit.line, column: firstHit.column, elapsedMs: Date.now() - start }
+      return { kind: 'found', needle, line: firstHit.line, column: firstHit.column, match: firstHit.match, elapsedMs: Date.now() - start }
     }
-    // Poll loop: check the transcript every 50ms, exit on match / exit /
-    // abort / timeout. The handle is read live each iteration (its transcript
-    // and exited fields mutate as the pty produces output).
-    while (true) {
-      if (signal?.aborted) signal.throwIfAborted()
-      if (handle.exited) {
-        return { kind: 'exited', needle, exitCode: handle.exitCode ?? null, exitSignal: signalNameOf(handle.exitSignal) }
+    // Register the active wait so the sidebar can show the wait banner (the
+    // snapshot's `waiting` field rides the agent-terminals push). Registered
+    // only after the fast paths: a wait that resolves instantly never
+    // flashes the banner. The notify() makes every push subscriber (the
+    // sidebar view) converge on the new waiting state immediately.
+    const record: AgentTerminalActiveWait = { needle, since: start, skipped: false }
+    handle.waits.push(record)
+    this.notify()
+    try {
+      // Exit outranks a skip in the same tick: `skipWait` flips `record.skipped`
+      // and the next poll observes it, but a pty that died first is the
+      // objective fact (a skip is moot once the process is gone). The user
+      // sees the same three things either way — the banner clears, `skipWait`
+      // reports 0 for the resolved wait, and the tool result says the wait
+      // ended — only the reported `kind` differs (see the design doc's
+      // implementation-deviation record).
+      while (true) {
+        if (signal?.aborted) signal.throwIfAborted()
+        if (handle.exited) {
+          return { kind: 'exited', needle, exitCode: handle.exitCode ?? null, exitSignal: signalNameOf(handle.exitSignal) }
+        }
+        if (record.skipped) {
+          return { kind: 'skipped', needle }
+        }
+        const hit = locateNeedle(handle.transcript, needle, re)
+        if (hit !== undefined) {
+          return { kind: 'found', needle, line: hit.line, column: hit.column, match: hit.match, elapsedMs: Date.now() - start }
+        }
+        if (Date.now() >= deadline) {
+          return { kind: 'timeout', needle, timeoutMs: timeout, totalLines: handle.transcript.split('\n').length }
+        }
+        await new Promise(resolve => {
+          const t = setTimeout(resolve, 50)
+          // Allow the Node process to exit even if the timer is pending.
+          if (typeof t === 'object' && 'unref' in t) (t as { unref: () => void }).unref()
+        })
       }
-      const hit = locateNeedle(handle.transcript, needle)
-      if (hit !== undefined) {
-        return { kind: 'found', needle, line: hit.line, column: hit.column, elapsedMs: Date.now() - start }
-      }
-      if (Date.now() >= deadline) {
-        return { kind: 'timeout', needle, timeoutMs: timeout, totalLines: handle.transcript.split('\n').length }
-      }
-      await new Promise(resolve => {
-        const t = setTimeout(resolve, 50)
-        // Allow the Node process to exit even if the timer is pending.
-        if (typeof t === 'object' && 'unref' in t) (t as { unref: () => void }).unref()
-      })
+    } finally {
+      const index = handle.waits.indexOf(record)
+      if (index !== -1) handle.waits.splice(index, 1)
+      this.notify()
     }
+  }
+
+  /**
+   * Mark every active wait on one terminal as skipped (the sidebar banner's
+   * skip button). Each waiting poll loop observes its record's flag within
+   * one 50ms tick and returns `{kind:'skipped'}`. Idempotent: 0 when nothing
+   * is waiting (a stale banner racing a wait that already resolved).
+   * @returns the number of waits that transitioned to skipped.
+   */
+  skipWait(uuid: string): number {
+    const handle = this.expect(uuid)
+    let count = 0
+    for (const record of handle.waits) {
+      if (!record.skipped) {
+        record.skipped = true
+        count += 1
+      }
+    }
+    return count
   }
 
   /**
