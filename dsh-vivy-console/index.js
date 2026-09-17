@@ -76,11 +76,19 @@ const norm = (p) => String(p || "").replace(/\\/g, "/")
 const apiPrefix = "/vivy-console/api"
 const FE_PORT = 3015
 const DEFAULT_ADDR = "127.0.0.1:8787"
+// How long a start may take to open its port before the console reports that
+// it could not confirm the process (Vite cold start stays well under this).
+const READY_TIMEOUT_MS = 30000
+// The kernel's organism lease outlives a hard-stopped backend by up to 30s
+// (internal/storage/sqlite:leaseTTL), which is why an immediate restart of the
+// same Journal can fail with "organism lease held". Keep the two in step.
+const LEASE_TTL_MS = 30000
 
 let exeOverride = "" // explicit backend binary (overrides auto-compile)
 let currentAddr = DEFAULT_ADDR
 let child = null // ChildProcess of the managed backend, null once exited
 let startedAtMs = 0
+let lastBackendStopMs = 0 // when this console last hard-stopped a backend
 let feChild = null // ChildProcess of the Vite dev server, null once exited
 let feStartedAtMs = 0
 let studioPort = 0
@@ -192,6 +200,34 @@ function portInUse(port) {
   })
 }
 
+// Wait for a freshly spawned child to either open its port (ready) or die.
+// Reporting a start that never happened is the failure mode this guards: the
+// operator sees a healthy-looking console, gets no reason, and retries.
+async function awaitReady(proc, port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      return { ready: false, exited: true, timedOut: false }
+    }
+    if (await portInUse(port)) return { ready: true, exited: false, timedOut: false }
+    if (Date.now() >= deadline) return { ready: false, exited: false, timedOut: true }
+    await new Promise((resolve) => setTimeout(resolve, 200))
+  }
+}
+
+function exitText(proc) {
+  if (proc.spawnError) return `无法启动进程：${proc.spawnError}`
+  if (proc.exitCode !== null) {
+    // A negative code is not the child's status: libuv reports spawn failures
+    // this way (for example -4058 = ENOENT, executable not found).
+    return proc.exitCode < 0
+      ? `无法启动进程（系统错误 ${proc.exitCode}）`
+      : `exit ${proc.exitCode}`
+  }
+  if (proc.signalCode) return `signal ${proc.signalCode}`
+  return "unknown"
+}
+
 async function probePort() {
   if (!(await portInUse(8787))) return 8787
   let port = 8790
@@ -199,35 +235,85 @@ async function probePort() {
   return port
 }
 
+// Read the tail of a log as text, starting at `fromOffset` (or from
+// `maxBytes` before EOF when no offset is given). "" when unreadable.
+function readLogText(path, maxBytes, fromOffset) {
+  try {
+    const size = statSync(path).size
+    if (size <= 0) return ""
+    const floor = typeof fromOffset === "number" ? fromOffset : 0
+    const start = Math.max(floor, size - maxBytes)
+    if (size <= start) return ""
+    const readSize = size - start
+    const buffer = Buffer.alloc(readSize)
+    const fd = openSync(path, "r")
+    let bytes = 0
+    try {
+      bytes = readSync(fd, buffer, 0, readSize, start)
+    } finally {
+      closeSync(fd)
+    }
+    return buffer.subarray(0, bytes).toString("utf8")
+  } catch {
+    return ""
+  }
+}
+
+function logSize(path) {
+  try {
+    return statSync(path).size
+  } catch {
+    return 0
+  }
+}
+
+function readLogLines(path, maxBytes) {
+  const text = readLogText(path, maxBytes)
+  if (!text) return []
+  const lines = text.split(/\r?\n/)
+  if (text.endsWith("\n")) lines.pop()
+  return lines
+}
+
+// The lines a freshly started child wrote since `fromOffset` — used to explain
+// a start that failed instead of claiming it succeeded.
+function freshLogTail(path, fromOffset, maxLines = 6, maxChars = 700) {
+  const text = readLogText(path, 64 * 1024, fromOffset)
+  if (!text) return ""
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-maxLines)
+  if (lines.length === 0) return ""
+  const joined = lines.join("\n")
+  return joined.length > maxChars ? "…" + joined.slice(-maxChars) : joined
+}
+
+function freshTailOf(logSources) {
+  return logSources
+    .map(([path, offset]) => freshLogTail(path, offset))
+    .filter(Boolean)
+    .join("\n")
+}
+
+// Failure reason for a start that did not come up: why the child died and what
+// it printed, so the console shows a cause instead of a bare "failed".
+function startFailureDetail(proc, port, ready, tail) {
+  const why = ready.exited
+    ? `进程在监听 ${port} 前已退出（${exitText(proc)}）`
+    : `启动超时：${Math.round(READY_TIMEOUT_MS / 1000)} 秒内未监听 ${port}（PID ${proc.pid} 仍在运行）`
+  return tail ? `${why}；日志尾部：\n${tail}` : `${why}；日志为空`
+}
+
 function readLogs() {
   // Unified timeline: backend lines + frontend (Vite dev) lines, each
   // tagged with its source so the client renders one feed with source
   // chips and filters by source.
-  const tail = (path, maxBytes) => {
-    try {
-      const size = statSync(path).size
-      if (size <= 0) return []
-      const readSize = Math.min(size, maxBytes)
-      const buffer = Buffer.alloc(readSize)
-      const fd = openSync(path, "r")
-      let bytes = 0
-      try {
-        bytes = readSync(fd, buffer, 0, readSize, size - readSize)
-      } finally {
-        closeSync(fd)
-      }
-      const text = buffer.subarray(0, bytes).toString("utf8")
-      const lines = text.split(/\r?\n/)
-      if (text.endsWith("\n")) lines.pop()
-      return lines
-    } catch {
-      return []
-    }
-  }
-  const gwOut = tail(outLogPath, 512 * 1024)
-  const gwErr = tail(errLogPath, 256 * 1024)
-  const feOut = tail(feOutLogPath, 512 * 1024)
-  const feErr = tail(feErrLogPath, 256 * 1024)
+  const gwOut = readLogLines(outLogPath, 512 * 1024)
+  const gwErr = readLogLines(errLogPath, 256 * 1024)
+  const feOut = readLogLines(feOutLogPath, 512 * 1024)
+  const feErr = readLogLines(feErrLogPath, 256 * 1024)
   const gwLines = [...gwOut, ...gwErr.map((line) => (line ? "[err] " + line : line))]
   const feLines = [...feOut, ...feErr.map((line) => (line ? "[err] " + line : line))]
   return {
@@ -307,7 +393,7 @@ function prepare(port) {
   writeFileSync(cfgPath, cfg, "utf8")
 }
 
-async function startBackend() {
+async function startBackend(attempt = 0) {
   if (child !== null && child.exitCode === null) {
     return { ok: false, message: "后端已在运行（本控制台管理）" }
   }
@@ -331,10 +417,13 @@ async function startBackend() {
   const port = await probePort()
   prepare(port)
   currentAddr = `127.0.0.1:${port}`
+  const outFrom = logSize(outLogPath)
+  const errFrom = logSize(errLogPath)
   const outFd = openSync(outLogPath, "a")
   const errFd = openSync(errLogPath, "a")
+  let proc = null
   try {
-    child = spawn(plan.exe, [], {
+    proc = spawn(plan.exe, [], {
       cwd: dirname(plan.exe) || root,
       env: {
         ...process.env,
@@ -354,18 +443,53 @@ async function startBackend() {
       message: "启动失败: " + (error instanceof Error ? error.message : String(error)),
     }
   }
+  child = proc
   startedAtMs = Date.now()
-  child.on("exit", () => {
+  proc.on("exit", () => {
     child = null
   })
-  child.on("error", () => {
+  proc.on("error", () => {
     child = null
   })
+  // Do not claim a start that did not happen: wait until the backend answers
+  // on its port, and if it died first report why instead of "已启动".
+  const ready = await awaitReady(proc, port, READY_TIMEOUT_MS)
+  if (!ready.ready) {
+    const tail = freshTailOf([
+      [outLogPath, outFrom],
+      [errLogPath, errFrom],
+    ])
+    const leaseWait = leaseWaitMs(ready, tail, attempt)
+    if (leaseWait > 0) {
+      // A backend this console hard-stopped holds its organism lease until the
+      // kernel TTL expires. That lease is ours, so wait it out once and retry
+      // rather than failing a restart the operator asked for.
+      await new Promise((resolve) => setTimeout(resolve, leaseWait))
+      return startBackend(attempt + 1)
+    }
+    return { ok: false, message: startFailureDetail(proc, port, ready, tail) }
+  }
   return {
     ok: true,
-    pid: child.pid,
-    message: `已启动 (PID ${child.pid})，监听 ${currentAddr}（纯 API 后端 · vivy_headless · 真实 provider · 数据隔离）`,
+    pid: proc.pid,
+    message:
+      `已启动 (PID ${proc.pid})，监听 ${currentAddr}（纯 API 后端 · vivy_headless · 真实 provider · 数据隔离）` +
+      (attempt > 0 ? "（已等待上一次运行的 workspace 租约过期）" : ""),
   }
+}
+
+// How long to wait before retrying a start that failed on a stale organism
+// lease. Only the backend this console just hard-stopped can be waited out:
+// a lease held by anyone else is a real conflict and must be reported.
+function leaseWaitMs(ready, tail, attempt) {
+  if (attempt > 0) return 0 // one retry only: never spin on a real conflict
+  if (!ready.exited || !/lease held/i.test(tail)) return 0
+  if (!lastBackendStopMs) return 0
+  const since = Date.now() - lastBackendStopMs
+  if (since > LEASE_TTL_MS + 60 * 1000) return 0
+  // The kernel lease lives 30s past its last heartbeat (<= the kill), so the
+  // remainder of that window plus a margin is enough.
+  return Math.max(2000, LEASE_TTL_MS - since + 1500)
 }
 
 async function stopBackend() {
@@ -373,6 +497,7 @@ async function stopBackend() {
     const pid = child.pid
     child.kill()
     child = null
+    lastBackendStopMs = Date.now()
     return { ok: true, message: `已停止 (PID ${pid})` }
   }
   const external = findExternalVivy()
@@ -385,6 +510,7 @@ async function stopBackend() {
   } catch {
     /* best effort */
   }
+  lastBackendStopMs = Date.now()
   return { ok: true, message: `已停止外部进程 (PID ${external.pid})` }
 }
 
@@ -449,10 +575,13 @@ async function startFrontend() {
   if (await portInUse(FE_PORT)) {
     return { ok: false, message: `端口 ${FE_PORT} 已被占用（可能外部 vite 已在运行）` }
   }
+  const outFrom = logSize(feOutLogPath)
+  const errFrom = logSize(feErrLogPath)
   const outFd = openSync(feOutLogPath, "a")
   const errFd = openSync(feErrLogPath, "a")
+  let proc = null
   try {
-    feChild = spawn("pnpm", ["dev"], {
+    proc = spawn("pnpm", ["dev"], {
       cwd: uiDir,
       shell: process.platform === "win32",
       // Vite proxies /rpc to the managed backend (ui/vite.config.ts reads
@@ -470,17 +599,29 @@ async function startFrontend() {
       message: "启动失败: " + (error instanceof Error ? error.message : String(error)),
     }
   }
+  feChild = proc
   feStartedAtMs = Date.now()
-  feChild.on("exit", () => {
+  proc.on("exit", () => {
     feChild = null
   })
-  feChild.on("error", () => {
+  proc.on("error", () => {
     feChild = null
   })
+  // `pnpm dev` can exit within milliseconds (a half-linked ui/node_modules is
+  // the classic cause) while the start still looked successful. Wait for the
+  // port, and on an early exit say what happened and what it printed.
+  const ready = await awaitReady(proc, FE_PORT, READY_TIMEOUT_MS)
+  if (!ready.ready) {
+    const tail = freshTailOf([
+      [feOutLogPath, outFrom],
+      [feErrLogPath, errFrom],
+    ])
+    return { ok: false, message: startFailureDetail(proc, FE_PORT, ready, tail) }
+  }
   return {
     ok: true,
-    pid: feChild.pid,
-    message: `前端 dev server 已启动 (PID ${feChild.pid})，监听 ${FE_PORT}（Vite，代理 /rpc → ${currentAddr}）`,
+    pid: proc.pid,
+    message: `前端 dev server 已启动 (PID ${proc.pid})，监听 ${FE_PORT}（Vite，代理 /rpc → ${currentAddr}）`,
   }
 }
 
