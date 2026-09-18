@@ -14,7 +14,7 @@ embedded-UI / standalone-UI split** and **no separate VIVY WEB debugging**:
 | --- | --- | --- |
 | 后端 Backend | **Pure-API** vivy binary (`go build -tags vivy_headless ./cmd/vivy`), auto-compiled from workspace source into Studio scratch; serves only the `/rpc` control plane — **no embedded frontend** | real OpenAI-compatible provider path (no product mock); data isolated under `data/studio-home/vivy-console/` via `VIVY_CONFIG` + `VIVY_USER_HOME`; status / start / stop / restart / EXE override |
 | 前端 Frontend | **The DEV dev server**: `pnpm dev` in `ui/`, `http://127.0.0.1:3015` — the single user-facing app | its `/rpc` proxy is pointed at the managed backend's live port (`VIVY_BACKEND_ADDR`); status / start / stop / restart / open |
-| 日志 Logs | **One unified timeline** of backend (`gateway.out.log`/`gateway.err.log`) and frontend (`frontend.out.log`/`frontend.err.log`) lines, tagged with source (后端/前端) | filter by source, pause, clear |
+| 日志 Logs | **One structured console** over the four raw streams: backend (`gateway.out.log`/`gateway.err.log`, slog JSON) and frontend (`frontend.out.log`/`frontend.err.log`, ANSI text) | level + source + text filters, follow/pause, row detail, copy; fed incrementally by a byte cursor (`logs.js`) |
 
 The console does **not** open or debug a "VIVY WEB page" of its own: you use
 the dev server at `http://127.0.0.1:3015` in the normal browser. The
@@ -41,7 +41,7 @@ Real Node plugin (no vm sandbox) that registers on the Studio `webServer`:
 
 | Route | Purpose |
 | --- | --- |
-| `/vivy-console/api/status` `logs` `resolve` | Status (backend + frontend) / unified log timeline / path resolution |
+| `/vivy-console/api/status` `logs` `resolve` | Status (backend + frontend) / structured log timeline / path resolution; `GET /logs?cursor=<4 byte offsets>` returns only what was appended since that cursor |
 | `/vivy-console/api/start` `stop` `restart` `setExe` | Backend lifecycle. **Start on the managed path first runs `go build -tags vivy_headless -o <scratch>/vivy-backend.exe ./cmd/vivy`** (incremental, output streamed into the backend log), then spawns it with the generated real-provider overlay (`VIVY_CONFIG` + `VIVY_USER_HOME` under Studio scratch) — every start reflects current workspace source; `runtime.mock` is not written (removed from product Config 2026-08-29) |
 | `/vivy-console/api/frontend/status` `start` `stop` `restart` | Vite dev server lifecycle; the child gets `VIVY_BACKEND_ADDR=http://127.0.0.1:<gateway-port>` so `ui/vite.config.ts` proxies `/rpc` to the live backend port |
 | `/vivy-console/api/code/status` `open` | **Vivy Code** TUI panel: status + open a dedicated console window (`go run ./cmd/vivy tui --demo` / `--plain`). Not part of backend/frontend lifecycle |
@@ -86,16 +86,71 @@ Hand-authored client module in the DSH client-modules handoff format
   JSON table per ledger, the action form (pack/eval/release/reject/install/
   rollback/inspect inputs), the release human-confirmation checkbox, and a
   live job-output viewer (one concurrent job).
-- **日志** — one unified timeline of 后端 + 前端 lines with source chips,
-  pause, clear.
+- **日志** — one structured console for 后端 + 前端: a mono code surface at
+  13/14/16px (小/中/大), a fixed `时间 · 级别 · 来源 · 消息` grid, severity
+  colour (error red / warn amber / info neutral / debug dimmed) plus a row
+  marker, level + source + free-text filters with counts, follow/pause,
+  wrap toggle, 复制 (view or single raw line), and click a row to expand its
+  raw text, caller, file:line and fields. 清空 clears the view without
+  reintroducing old lines.
+
+## Log model (`logs.js`)
+
+The host half reads each stream as a **byte window** and hands it to the pure
+module `logs.js`, which is the single place a level, timestamp or caller is
+derived (the client never re-infers one). Unit tests:
+
+```text
+node --test studio/dsh-vivy-console/logs.test.mjs
+```
+
+`GET /vivy-console/api/logs` answers:
+
+```json
+{
+  "ok": true, "atMs": 0, "mode": "tail", "cursor": "0.0.0.0",
+  "reset": false, "omitted": false,
+  "lines": [{
+    "id": "b:out:42010", "src": "backend", "stream": "out", "kind": "json",
+    "level": "info", "ts": 0, "msg": "", "caller": "", "file": "", "line": 0,
+    "fields": {}, "text": "…", "partial": false
+  }],
+  "backend": { "logPath": "…", "errPath": "…", "running": false },
+  "frontend": { "logPath": "…", "errPath": "…", "running": false }
+}
+```
+
+- `cursor` is four byte offsets (`backend.out.backend.err.frontend.out.frontend.err`).
+  A poll that sends it back gets `mode:"delta"` and only newly appended records;
+  an idle poll returns an empty list. A malformed cursor is ignored (fresh tail).
+- `id` is stable per raw line (`<b|f>:<out|err>:<line byte offset>`), so a line
+  still being written (`partial:true`, cursor held at its start) returns again
+  complete under the same id and the client upserts it.
+- `reset` means the file was rotated/truncated (the read restarted as a tail);
+  `omitted` means the returned window skips earlier content (tail clipping or a
+  backlog larger than the delta cap).
+- `kind:"cont"` is a continuation of the previous structured line (indented Go
+  stack frames, pnpm/tool error blocks); it inherits that line's level. A plain
+  line that does not look like a continuation is its own `text` record with a
+  level inferred from wording, ANSI colour (red/amber SGR) and stream (stderr
+  counts as at least a warning). ANSI escapes are stripped from `text`.
+- Ordering merges all four streams by timestamp; a record without a timestamp
+  inherits the last timestamp of its own source, and a source with no
+  timestamps at all (today: Vite) sorts after the timestamped records in read
+  order.
+- The response keeps `lines[].src`/`lines[].text`, so an older client still
+  renders the feed; a client that sees no `cursor` falls back to whole-tail
+  refresh and labels itself 「主机未重启：整段刷新」.
 
 ## Install
 
 Composed into the `vivy-studio` profile by `launch-vivy-studio.ps1`
 (dependency + `dsh.profile.bundles` entry), so a normal
 `.\launch-vivy-studio.ps1` boots with the console enabled. To apply an
-edited source to a running profile: sync the installed copy at
-`data/studio-home/profiles/vivy-studio/node_modules/dsh-vivy-console/` and
+edited source to the installed profile(s): copy every file of this directory
+(including `logs.js` — the host half imports it) over
+`data/studio-home/profiles/vivy-studio/node_modules/dsh-vivy-console/`
+and, when present, the same path under `profiles/vivy-studio-next/`, then
 restart Studio (skin-style injection — no hot reload). The client bundle is
 served fresh per request (tab changes appear after a browser refresh); the
 host-half routes need the restart.

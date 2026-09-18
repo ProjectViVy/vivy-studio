@@ -29,7 +29,10 @@
 // touched (ST-2).
 //
 // Routes registered on the Studio webServer:
-//   *    /vivy-console/api/*          -> JSON API (backend + frontend + logs)
+//   *    /vivy-console/api/*          -> JSON API (backend + frontend + logs);
+//                                        GET /logs?cursor=<4 byte offsets> is
+//                                        the incremental structured timeline
+//                                        (parsing in logs.js, unit tested)
 //   *    /vivy-console/api/lifecycle/*-> packaging & version management
 //                                        (vivy-studio.exe: pack/eval/release/
 //                                        reject/install/rollback + ledger)
@@ -53,6 +56,7 @@ import {
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
 import net from "node:net"
+import { buildRecords, formatCursor, mergeTimeline, parseCursor, splitBufferLines } from "./logs.js"
 
 export const name = "vivy-console"
 export const inject = ["webServer"]
@@ -238,25 +242,12 @@ async function probePort() {
 // Read the tail of a log as text, starting at `fromOffset` (or from
 // `maxBytes` before EOF when no offset is given). "" when unreadable.
 function readLogText(path, maxBytes, fromOffset) {
-  try {
-    const size = statSync(path).size
-    if (size <= 0) return ""
-    const floor = typeof fromOffset === "number" ? fromOffset : 0
-    const start = Math.max(floor, size - maxBytes)
-    if (size <= start) return ""
-    const readSize = size - start
-    const buffer = Buffer.alloc(readSize)
-    const fd = openSync(path, "r")
-    let bytes = 0
-    try {
-      bytes = readSync(fd, buffer, 0, readSize, start)
-    } finally {
-      closeSync(fd)
-    }
-    return buffer.subarray(0, bytes).toString("utf8")
-  } catch {
-    return ""
-  }
+  const size = logSize(path)
+  if (size <= 0) return ""
+  const floor = typeof fromOffset === "number" ? fromOffset : 0
+  const start = Math.max(floor, size - maxBytes)
+  if (size <= start) return ""
+  return readRange(path, start, size).toString("utf8")
 }
 
 function logSize(path) {
@@ -267,12 +258,25 @@ function logSize(path) {
   }
 }
 
-function readLogLines(path, maxBytes) {
-  const text = readLogText(path, maxBytes)
-  if (!text) return []
-  const lines = text.split(/\r?\n/)
-  if (text.endsWith("\n")) lines.pop()
-  return lines
+// Raw bytes of [start, end); empty when the file cannot be read. Byte positions
+// (not string lengths) are what the log cursor compares, so multi-byte lines
+// stay aligned.
+function readRange(path, start, end) {
+  const length = Math.max(0, end - start)
+  if (length === 0) return Buffer.alloc(0)
+  try {
+    const buffer = Buffer.alloc(length)
+    const fd = openSync(path, "r")
+    let bytes = 0
+    try {
+      bytes = readSync(fd, buffer, 0, length, start)
+    } finally {
+      closeSync(fd)
+    }
+    return buffer.subarray(0, bytes)
+  } catch {
+    return Buffer.alloc(0)
+  }
 }
 
 // The lines a freshly started child wrote since `fromOffset` — used to explain
@@ -306,27 +310,122 @@ function startFailureDetail(proc, port, ready, tail) {
   return tail ? `${why}；日志尾部：\n${tail}` : `${why}；日志为空`
 }
 
-function readLogs() {
-  // Unified timeline: backend lines + frontend (Vite dev) lines, each
-  // tagged with its source so the client renders one feed with source
-  // chips and filters by source.
-  const gwOut = readLogLines(outLogPath, 512 * 1024)
-  const gwErr = readLogLines(errLogPath, 256 * 1024)
-  const feOut = readLogLines(feOutLogPath, 512 * 1024)
-  const feErr = readLogLines(feErrLogPath, 256 * 1024)
-  const gwLines = [...gwOut, ...gwErr.map((line) => (line ? "[err] " + line : line))]
-  const feLines = [...feOut, ...feErr.map((line) => (line ? "[err] " + line : line))]
+// ---- unified structured log feed (/logs) ----
+//
+// The four raw streams are read as byte windows and parsed by logs.js into one
+// ordered timeline of records (level, timestamp, caller, fields). A cursor of
+// four byte offsets makes the feed incremental: the panel polls with the cursor
+// it last received, so an idle poll returns nothing, a paused panel loses
+// nothing, and 清空 in the UI stays cleared instead of being refilled.
+const MAX_TAIL_BYTES = 512 * 1024
+const MAX_ERR_TAIL_BYTES = 256 * 1024
+// A cold or paused console can face a large backlog; skipping the middle of it
+// beats reading it all on one poll, so a delta read jumps to the newest cap.
+const MAX_DELTA_BYTES = 1024 * 1024
+// Lines per stream on the first (tail) read; the panel keeps its own view cap.
+const TAIL_LINES_PER_STREAM = 300
+
+const LOG_STREAMS = [
+  { src: "backend", stream: "out", path: outLogPath, tailBytes: MAX_TAIL_BYTES },
+  { src: "backend", stream: "err", path: errLogPath, tailBytes: MAX_ERR_TAIL_BYTES },
+  { src: "frontend", stream: "out", path: feOutLogPath, tailBytes: MAX_TAIL_BYTES },
+  { src: "frontend", stream: "err", path: feErrLogPath, tailBytes: MAX_ERR_TAIL_BYTES },
+]
+
+// One stream's window since `from` (or the newest tail when `from` is absent).
+// A file smaller than `from` was rotated or truncated: the read restarts as a
+// tail and says so, instead of resuming into the middle of another file.
+function readLogWindow(path, tailBytes, from) {
+  const size = logSize(path)
+  if (size <= 0) return { lines: [], size: 0, reset: false, omitted: false }
+  let reset = false
+  let offset = from
+  if (typeof offset === "number") {
+    // A cursor claims a line start. A shorter file — or a byte that is no longer
+    // the newline it used to follow — means the file was rotated, truncated or
+    // rewritten, so the read restarts as a tail instead of resuming into the
+    // middle of content that is no longer there.
+    if (offset > size) {
+      reset = true
+      offset = null
+    } else if (offset > 0) {
+      const previous = readRange(path, offset - 1, offset)
+      if (previous.length === 1 && previous[0] !== 0x0a) {
+        reset = true
+        offset = null
+      }
+    }
+  }
+  let omitted = false
+  let start = 0
+  // A cursor is always a line start, so a delta read must not skip forward —
+  // that is how a half-written line comes back as `partial` and is completed by
+  // the next poll. Only a tail read (or a delta that had to jump past the byte
+  // cap) starts at an arbitrary byte and has to snap to a line boundary.
+  let snap = false
+  if (typeof offset === "number") {
+    start = offset
+    if (size - start > MAX_DELTA_BYTES) {
+      start = size - MAX_DELTA_BYTES
+      omitted = true
+      snap = true
+    }
+  } else {
+    start = Math.max(0, size - tailBytes)
+    snap = true
+  }
+  let buffer = readRange(path, start, size)
+  if (snap && start > 0) {
+    const newline = buffer.indexOf(0x0a)
+    if (newline === -1) return { lines: [], size, reset, omitted: true }
+    buffer = buffer.subarray(newline + 1)
+    start += newline + 1
+    if (typeof offset !== "number") omitted = true
+  }
+  return { lines: splitBufferLines(buffer, start), size, reset, omitted }
+}
+
+function readLogs(query) {
+  // Unified timeline: backend (kernel slog JSON) + frontend (Vite dev) lines,
+  // each record carrying its source, stream, level and timestamp so the client
+  // filters and colours without re-deriving anything.
+  const offsets = parseCursor(query ? query.get("cursor") : null)
+  const records = []
+  const next = []
+  let reset = false
+  let omitted = false
+  for (const [index, spec] of LOG_STREAMS.entries()) {
+    const from = offsets === null ? undefined : offsets[index]
+    const window = readLogWindow(spec.path, spec.tailBytes, from)
+    reset = reset || window.reset
+    omitted = omitted || window.omitted
+    let lines = window.lines
+    if (typeof from !== "number" && lines.length > TAIL_LINES_PER_STREAM) {
+      lines = lines.slice(lines.length - TAIL_LINES_PER_STREAM)
+      omitted = true
+    }
+    for (const record of buildRecords(lines, spec.src, spec.stream)) records.push(record)
+    // A line still being written keeps its cursor so the completed line returns
+    // with the same id and replaces the partial one.
+    const last = lines.length > 0 ? lines[lines.length - 1] : null
+    next.push(last !== null && last.partial ? last.offset : window.size)
+  }
   return {
-    lines: [
-      ...gwLines.slice(-300).map((line) => ({ src: "backend", text: line })),
-      ...feLines.slice(-300).map((line) => ({ src: "frontend", text: line })),
-    ],
+    ok: true,
+    atMs: Date.now(),
+    mode: offsets === null ? "tail" : "delta",
+    cursor: formatCursor(next),
+    reset,
+    omitted,
+    lines: mergeTimeline(records),
     backend: {
       logPath: norm(outLogPath),
+      errPath: norm(errLogPath),
       running: child !== null && child.exitCode === null,
     },
     frontend: {
       logPath: norm(feOutLogPath),
+      errPath: norm(feErrLogPath),
       running: feChild !== null && feChild.exitCode === null,
     },
   }
@@ -959,7 +1058,7 @@ async function handleConsoleApi(req, res, route) {
       payload = await status()
       break
     case "GET /logs":
-      payload = readLogs()
+      payload = readLogs(new URL(req.url || "/", "http://console.local").searchParams)
       break
     case "GET /resolve":
       payload = {
