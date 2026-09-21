@@ -1,0 +1,6 @@
+# Vivy Studio 物种工作台 bundle patch: one plugin row registered on the
+# profile root beside the console row. The workbench registers a
+# conversation-view tab; it never registers dev-loop processes.
+- insert:
+    - id: species-workbench
+      name: dsh-species-workbench

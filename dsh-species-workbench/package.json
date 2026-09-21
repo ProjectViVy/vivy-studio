@@ -1,0 +1,36 @@
+{
+  "name": "dsh-species-workbench",
+  "version": "0.1.0",
+  "description": "Vivy Studio 物种工作台: current species inspect (read-only), Generation ledger with next-step guidance, human-gated install/rollback switching, and the recipe editor that packs new species through vivy-studio.exe",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "species.js",
+    "recipe.js",
+    "jobs.js",
+    "species.test.mjs",
+    "recipe.test.mjs",
+    "confirm.test.mjs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ],
+      "platform": "web"
+    }
+  },
+  "license": "MIT"
+}
