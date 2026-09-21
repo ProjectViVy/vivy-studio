@@ -111,7 +111,9 @@ Hand-authored client module in the DSH client-modules handoff format
   releases / installs / events / worktrees) with `vivy-studio.exe` reads, a
   JSON table per ledger, the action form (pack/eval/release/reject/install/
   rollback/inspect inputs), the release human-confirmation checkbox, and a
-  live job-output viewer (one concurrent job).
+  live job-output viewer (one concurrent job). Pack speaks the v1 recipe
+  contract: a recipe file (`--recipe`, required) plus optional `--source`
+  module dirs; the v0 `--with` plugin list is rejected by vivy-sdk.
 - **日志** — one structured console for 后端 + 前端: a mono code surface at
   13/14/16px (小/中/大), a fixed `时间 · 级别 · 来源 · 消息` grid, severity
   colour (error red / warn amber / info neutral / debug dimmed) plus a row

@@ -913,10 +913,16 @@ function lifecycleRun(body) {
   }
   switch (action) {
     case "pack": {
-      const withList = Array.isArray(body.with) ? body.with : []
-      for (const name of withList) {
-        push("--with")
-        push(name)
+      // v1 recipe contract (PLG-P2): the Recipe is the sole selection
+      // authority; vivy-sdk rejects --with.
+      if (typeof body.recipe !== "string" || body.recipe === "") {
+        return { ok: false, message: "打包需要 Recipe 文件（--recipe）" }
+      }
+      push("--recipe")
+      push(body.recipe)
+      for (const dir of Array.isArray(body.source) ? body.source : []) {
+        push("--source")
+        push(dir)
       }
       if (body.out) {
         push("--out")

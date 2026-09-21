@@ -852,7 +852,7 @@
         const [err, setErr] = useState("")
         const [job, setJob] = useState(null)
         const [form, setForm] = useState({
-          with: "", candidate: "", baseline: "", suite: "",
+          recipe: "", source: "", candidate: "", baseline: "", suite: "",
           generation: "", eval: "", release: "", target: "", confirm: false,
         })
         const preRef = useRef(null)
@@ -882,7 +882,10 @@
         function set(field, value) { setForm((f) => ({ ...f, [field]: value })) }
         function run(action) {
           const body = { action: action, ...form }
-          if (action === "pack") body.with = form.with.split(",").map((s) => s.trim()).filter(Boolean)
+          if (action === "pack") {
+            body.recipe = form.recipe.trim()
+            body.source = form.source.split(",").map((s) => s.trim()).filter(Boolean)
+          }
           call("POST", "/lifecycle/run", body).then((r) => {
             if (r && r.ok) { setJob({ id: r.id, action: action, status: "running", output: [], exitCode: null }); setErr("") }
             else setErr((r && r.message) || "任务启动失败")
@@ -898,7 +901,8 @@
         }
 
         const fields = [
-          { key: "with", label: "插件(逗号分隔)" },
+          { key: "recipe", label: "Recipe 文件(如 recipes/minimal.vivy.yml)" },
+          { key: "source", label: "额外源目录(逗号分隔,可选)" },
           { key: "candidate", label: "候选 gen" },
           { key: "baseline", label: "基线 gen" },
           { key: "suite", label: "套件" },
