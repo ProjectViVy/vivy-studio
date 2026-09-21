@@ -56,6 +56,32 @@ Air gap: backend data lives only under `data/studio-home/vivy-console/`
 (Studio's own scratch); the production Journal (`data/vivy.db`,
 `data/demo/`, `data/workspaces/`) is never touched.
 
+## Managed backend config (`backendConfig`)
+
+总控台 writes the managed backend's `config.yaml` on every start
+(`backendConfig(port, dir)` in `index.js`). The kernel decodes that file
+strictly, so a key the config struct does not declare aborts startup before
+the listener opens — the console then reports a start that never happened,
+with only the gateway log to explain it. Provider metadata (endpoints,
+protocols, models, credential variable names) has been embedded in the
+backend since PROV-P1/P3, so `providers` carries `active` alone: no bundle
+directory and no per-vendor block.
+
+`tools` carries `approval` alone. `tools.enabled` is deliberately **not**
+written: since the two-tier tool work (2026-08-31) that key is the sole
+admission gate for the whole surface, so the template's old
+`enabled: [echo_info]` left the managed model without a single T1 tool —
+`ask_user`, `list_dir`, `read_file`, `search_files`, `write_file`, `patch`,
+`multiedit`, `execute`, `bash`, `skills_list`, `skill_view` were all filtered
+out before the engine built them, and the Eino `tool_search` catalog (which
+only spans active tools) could find nothing but `echo_info`. Omitting the key
+preserves the kernel's code default (`internal/config` `Tools.UnmarshalYAML`),
+which is the surface the dev loop exists to exercise. Unit tests:
+
+```text
+node --test studio/dsh-vivy-console/config.test.mjs
+```
+
 ## Client half (`client.js`)
 
 Hand-authored client module in the DSH client-modules handoff format

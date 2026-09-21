@@ -454,42 +454,49 @@ function findExternalVivy() {
   }
 }
 
-function prepare(port) {
-  mkdirSync(join(consoleDir, "data", "workspaces"), { recursive: true })
-  mkdirSync(join(consoleDir, "data", "skills"), { recursive: true })
-  const d = norm(consoleDir)
-  // No allowed_origins needed: the headless backend has no UI of its own
-  // and the Vite dev UI talks to /rpc same-origin through its own proxy.
-  // Real-provider path only (2026-08-29): runtime.mock was removed from
-  // product Config. Keys live under this scratch user home / settings.yaml
-  // (or a frozen ENV session) — never a mock provider.
-  const cfg = [
+// The config the managed backend is launched with. Exported because the
+// kernel decodes it strictly: naming a key it does not know aborts startup
+// before the listener opens, so this producer's shape is unit tested
+// (config.test.mjs) rather than discovered from a gateway log.
+export function backendConfig(port, dir) {
+  return [
     "server:",
     `  addr: "127.0.0.1:${port}"`,
     "storage:",
     "  backend: sqlite",
     "  sqlite:",
-    `    path: "${d}/data/vivy.db"`,
+    `    path: "${dir}/data/vivy.db"`,
     "providers:",
+    // `active` only (PROV-P1/P3). Endpoints, protocols, models and credential
+    // variable names are embedded in the backend; a per-vendor block or a
+    // bundle_dir here is an unknown key and aborts startup under the strict
+    // config decoder. The active vendor reads its own credential env var.
     "  active: openai",
-    `  bundle_dir: "${norm(root)}/fixtures/provider"`,
-    "  openai:",
-    "    env_key: OPENAI_API_KEY",
-    "    default_model: gpt-4o-mini",
-    "  anthropic:",
-    "    env_key: ANTHROPIC_API_KEY",
-    "    default_model: claude-sonnet-4-5",
     "runtime:",
-    `  workspace_root: "${d}/data/workspaces"`,
-    `  skills_root: "${d}/data/skills"`,
+    `  workspace_root: "${dir}/data/workspaces"`,
+    `  skills_root: "${dir}/data/skills"`,
     "tools:",
-    "  enabled:",
-    "    - echo_info",
+    // `enabled` is deliberately omitted (2026-09-19). Since the two-tier tool
+    // work (2026-08-31) tools.enabled is the sole admission gate for the whole
+    // surface, so a debug-fixture list here (was: echo_info alone) leaves the
+    // model without any T1 tool — including the fixed-visible ask_user/
+    // list_dir/read_file/... core. Omitting the key preserves the kernel's
+    // code default (internal/config Tools.UnmarshalYAML).
     "  approval:",
     "    expiration: 5m",
     "",
   ].join("\n")
-  writeFileSync(cfgPath, cfg, "utf8")
+}
+
+function prepare(port) {
+  mkdirSync(join(consoleDir, "data", "workspaces"), { recursive: true })
+  mkdirSync(join(consoleDir, "data", "skills"), { recursive: true })
+  // No allowed_origins needed: the headless backend has no UI of its own
+  // and the Vite dev UI talks to /rpc same-origin through its own proxy.
+  // Real-provider path only (2026-08-29): runtime.mock was removed from
+  // product Config. Keys live under this scratch user home / settings.yaml
+  // (or a frozen ENV session) — never a mock provider.
+  writeFileSync(cfgPath, backendConfig(port, norm(consoleDir)), "utf8")
 }
 
 async function startBackend(attempt = 0) {
