@@ -20,21 +20,32 @@
  * 全部为纯函数(可单测);持久化与网络在宿主侧(store.js / index.js)。
  */
 
-import { CODING_PLAN_PROVIDER_IDS, QWEN_TOKEN_PLAN_PROVIDER_IDS, SCNET_TOKEN_PLAN_PROVIDER_IDS } from './coding-plans.js'
-import { canonModelId } from './pricing.js'
+import { CODING_PLAN_PROVIDER_IDS, QWEN_TOKEN_PLAN_PROVIDER_IDS, SCNET_TOKEN_PLAN_PROVIDER_IDS, MIMO_TOKEN_PLAN_PROVIDER_IDS } from './coding-plans.js'
+import { canonModelId, LEGACY_GO_MODEL_IDS } from './pricing.js'
+import { inferPlanProviderId } from './plan-provider-match.js'
 
-/** Plan 统计支持的提供商 id:9 家 Coding Plan + OpenCode Go。 */
-export const PLAN_PROVIDER_IDS = [...CODING_PLAN_PROVIDER_IDS, 'go']
+/** 可查询额度的套餐，以及只做本地归属统计的独立订阅产品。 */
+export const PLAN_PROVIDER_IDS = [...CODING_PLAN_PROVIDER_IDS, 'go', 'codex', 'volcengine-agent', 'tencent-coding', 'tencent-token', 'baidu-coding']
 
-/** 请求 provider 名 → Plan 提供商 id 的别名归并(路由渠道 zen/opencode 都是 Go)。 */
+/** 请求 provider 名 → Plan 提供商 id；保留宿主历史 zen/opencode 的 Go 路由语义。
+ * 显式 opencode-zen 为按量渠道，不作为 Go 别名。 */
 export const PLAN_PROVIDER_ALIASES = {
-  go: ['go', 'zen', 'opencode', 'opencode-go'],
+  opendesign: ['opendesign', 'open-design', 'open-design-api', 'amr-link.open-design.ai'],
+  go: ['go', 'zen', 'opencode', 'opencode-go', 'opencode-go-plus'],
+  codex: ['codex', 'openai-codex', 'dsh-openai-codex'],
+  'volcengine-agent': ['volcengine-agent', 'ark-agent-plan', 'volcengine-agent-plan'],
+  'tencent-coding': ['tencent-coding', 'tencent-coding-plan', 'tokenhub-coding-plan'],
+  'tencent-token': ['tencent-token', 'tencent-token-plan', 'tokenhub-token-plan'],
+  'baidu-coding': ['baidu-coding-plan', 'qianfan-coding-plan'],
   qwen: QWEN_TOKEN_PLAN_PROVIDER_IDS,
   scnet: SCNET_TOKEN_PLAN_PROVIDER_IDS,
+  mimo: MIMO_TOKEN_PLAN_PROVIDER_IDS,
+  factory: ['factory', 'droid', 'factory-a', 'factory-g', 'factory-o'],
 }
 
 /** 各 Plan 提供商的默认计费类别(auto = 跟随该家启用开关)。 */
 export const DEFAULT_PLAN_PROVIDER_CLASS = {
+  opendesign: 'plan',
   anthropic: 'auto',
   zai: 'auto',
   minimax: 'auto',
@@ -45,7 +56,14 @@ export const DEFAULT_PLAN_PROVIDER_CLASS = {
   scnet: 'auto',
   volcengine: 'auto',
   qwen: 'auto',
+  mimo: 'auto',
+  factory: 'auto',
   go: 'auto',
+  codex: 'auto',
+  'volcengine-agent': 'plan',
+  'tencent-coding': 'plan',
+  'tencent-token': 'plan',
+  'baidu-coding': 'plan',
 }
 
 /** 采样保留:每 provider×window 最多条数、最长时间(90 天)、差分区间时效与段跨度(7 天)。 */
@@ -62,21 +80,23 @@ export const PLAN_PER1_CONFIDENT_DELTA_P = 5
 export const HOUR_BUCKET_RETENTION_MS = 48 * 3600_000
 
 /** 归一化请求 provider 名到 Plan 提供商 id;非 Plan 渠道返回 null。 */
-export function planProviderIdOf(provider) {
+export function planProviderIdOf(provider, planBilling, modelId) {
   let name = String(provider ?? '').trim().toLowerCase()
   if (name.startsWith('llm-')) name = name.slice(4) // 宿主包装路由 llm-zen 等(pricing 同款剥离)
+  const assigned = planBilling?.modelPlans?.[`${provider}:${modelId}`] ?? planBilling?.modelPlans?.[`${name}:${modelId}`]
+  if (PLAN_PROVIDER_IDS.includes(assigned)) return assigned
   if (name.length === 0) return null
   for (const [id, aliases] of Object.entries(PLAN_PROVIDER_ALIASES)) {
     if (aliases.includes(name)) return id
   }
-  return PLAN_PROVIDER_IDS.includes(name) ? name : null
+  return PLAN_PROVIDER_IDS.includes(name) ? name : inferPlanProviderId(provider, modelId)
 }
 
 /**
  * 路由调用判定(用户实测:v1.5.53 跨目录兑底后,Go/Zen 网关路由的调用
  * provider 落账为空/'deepseek',但模型属于第三方目录——这类消费应跟随
  * 其 Plan 归类而非误入真金白银)。判定:模型不在 DeepSeek 主表(canon
- * 等价)且在任一第三方目录 canon 等价命中 → true。
+ * 等价)且在 Go 本渠道目录 canon 等价命中 → true。只保留已存在的旧宿主路由兼容集合；新模型不能仅凭名字推断订阅。
  * 结果按 prices 对象引用缓存(挂载/同步价格极少发生,进程内失效即可)。
  */
 const ROUTING_CACHE = new WeakMap()
@@ -85,8 +105,9 @@ function routingTableOf(prices) {
   if (cache === undefined) {
     const dsCanon = new Set(Object.keys(prices?.models ?? {}).map(canonModelId))
     const thirdCanon = new Set()
-    for (const table of Object.values(prices?.providers ?? {})) {
-      for (const id of Object.keys(table?.models ?? {})) thirdCanon.add(canonModelId(id))
+    const legacy = new Set(LEGACY_GO_MODEL_IDS.map(canonModelId))
+    for (const id of Object.keys(prices?.providers?.['opencode-go']?.models ?? {})) {
+      if (legacy.has(canonModelId(id))) thirdCanon.add(canonModelId(id))
     }
     for (const id of dsCanon) thirdCanon.delete(id)
     cache = { dsCanon, thirdCanon }
@@ -119,16 +140,20 @@ export function isRoutedThirdPartyCall(provider, modelId, prices) {
  * @param prices - 可选价格表(prices.models/providers),用于路由调用判定。
  */
 export function billingClassOf(provider, modelId, planBilling, enabledPlans, prices) {
-  let planId = planProviderIdOf(provider)
+  // Official web request fees always draw from the API wallet, independently of model plans.
+  if (provider === 'deepseek-official' && ['deepseek-web-search', 'deepseek-web-fetch'].includes(modelId)) return 'api'
+  let planId = planProviderIdOf(provider, planBilling, modelId)
   if (planId === null && isRoutedThirdPartyCall(provider, modelId, prices)) planId = 'go'
-  if (planId === null) return 'api'
   const models = planBilling?.models
   if (models !== null && typeof models === 'object') {
     const direct = models[`${provider}:${modelId}`]
     if (direct === 'plan' || direct === 'api') return direct
-    const canonical = models[`${planId}:${modelId}`]
-    if (canonical === 'plan' || canonical === 'api') return canonical
+    if (planId !== null) {
+      const canonical = models[`${planId}:${modelId}`]
+      if (canonical === 'plan' || canonical === 'api') return canonical
+    }
   }
+  if (planId === null) return 'api'
   const providers = planBilling?.providers
   const configured = providers !== null && typeof providers === 'object' ? providers[planId] : undefined
   if (configured === 'plan' || configured === 'api') return configured
@@ -145,7 +170,14 @@ export function enabledPlanSetOf(config) {
     }
   }
   if (config?.goQuota?.enabled === true) out.add('go')
+  if (config?.codexQuotaEnabled === true) out.add('codex')
   return out
+}
+
+/** Only classification and pricing participate; credential changes are unrelated. */
+export function planUsageFingerprint(config) {
+  return JSON.stringify([config?.planBilling, [...enabledPlanSetOf(config)], config?.prices, config?.priceOverrides,
+    config?.priceMatch, config?.exchangeRate, config?.peakEnabled, config?.peakEffectiveAt, config?.peakWindows, config?.peakHolidays])
 }
 
 /**
@@ -157,7 +189,7 @@ export function canonicalWindowKey(name) {
   if (n.length === 0) return 'unknown'
   if (/5\s*h|five|rolling/.test(n)) return 'fiveHour'
   if (/week|seven_?day|7\s*d/.test(n)) return 'weekly'
-  if (/month/.test(n)) return 'monthly'
+  if (/month/.test(n) || n === 'plan') return 'monthly' // MiMo monthUsage 的套餐窗口。
   if (/daily|^day$/.test(n)) return 'daily'
   // 滚动窗命名(duration+timeUnit,Kimi limits[] 的 '5h'/'1w'/'2d'/'1mo'):
   // 按时间量级归入最近标准周期,避免落进 periodStartOf 的 48h 兜底——满窗
@@ -249,7 +281,7 @@ export function aggregateUsageSince(days, hourBuckets, provider, startMs, nowMs,
     for (const [key, entry] of Object.entries(day?.byProviderModel ?? {})) {
       const sep = key.indexOf(':')
       const prefix = sep > 0 ? key.slice(0, sep) : key
-      if (planProviderIdOf(prefix) !== provider && !(provider === 'go' && isRoutedThirdPartyCall(prefix, sep > 0 ? key.slice(sep + 1) : key, prices))) continue
+      if (planProviderIdOf(prefix, planBilling, sep > 0 ? key.slice(sep + 1) : key) !== provider && !(provider === 'go' && isRoutedThirdPartyCall(prefix, sep > 0 ? key.slice(sep + 1) : key, prices))) continue
       if (billingClassOf(prefix, sep > 0 ? key.slice(sep + 1) : key, planBilling, enabledPlans, prices) !== 'plan') continue
       out.tokens += tokNum(entry?.input) + tokNum(entry?.output) + tokNum(entry?.cacheRead) + tokNum(entry?.cacheWrite) + tokNum(entry?.reasoning)
       out.cost += Number(entry?.cost) || 0
@@ -372,6 +404,9 @@ export function suggestPlanAutoClasses(days, config) {
  * @returns 新对象不改入参。
  */
 export function recordSamples(samples, providerId, windows, localAggOf, nowMs) {
+  // Factory pools and rolling account windows have no local per-call pool
+  // attribution; their percentages cannot yield a truthful per-1% estimate.
+  if (providerId === 'factory') return samples ?? {}
   const now = Number.isFinite(nowMs) && nowMs > 0 ? nowMs : Date.now()
   const forWindow = typeof localAggOf === 'function' ? localAggOf : (localAggOf && typeof localAggOf.forWindow === 'function' ? localAggOf.forWindow : null)
   const fixedStart = localAggOf !== null && typeof localAggOf === 'object' && typeof localAggOf.fixedStart === 'function' ? localAggOf.fixedStart : null
@@ -379,6 +414,8 @@ export function recordSamples(samples, providerId, windows, localAggOf, nowMs) {
   const current = byProvider[providerId] !== null && typeof byProvider[providerId] === 'object' ? byProvider[providerId] : {}
   const next = { ...byProvider, [providerId]: { ...current } }
   for (const [name, win] of Object.entries(windows ?? {})) {
+    // MiMo 补偿积分无独立本地归属，不能拿全部调用去估算该积分池。
+    if (providerId === 'mimo' && name !== 'plan') continue
     if (win === null || typeof win !== 'object') continue
     const percent = Number(win.percent)
     if (!Number.isFinite(percent) || percent < 0) continue
@@ -535,6 +572,7 @@ export function buildPlanStats({ days, hourBuckets, samples, codingPlans, goQuot
     const wins = {}
     const intervalsByWindow = {}
     for (const [name, win] of Object.entries(windowsRaw)) {
+      if (providerId === 'mimo' && name !== 'plan') continue
       if (win === null || typeof win !== 'object') continue
       if (!Number.isFinite(Number(win.percent))) continue
       const wk = canonicalWindowKey(name)
@@ -554,7 +592,7 @@ export function buildPlanStats({ days, hourBuckets, samples, codingPlans, goQuot
     if (Object.keys(wins).length > 0) providers[providerId] = { windows: wins, intervals: intervalsByWindow }
   }
   for (const [id, plan] of Object.entries(codingPlans ?? {})) {
-    if (id === 'scnet') continue // 本地自估百分比不参与采样估算(自我引用无意义)
+    if (id === 'scnet' || id === 'factory') continue // 无可对应的本地周期／额度池，不估算每 1%。
     collect(id, plan?.status, plan?.windows)
   }
   collect('go', goQuota?.status, goQuota ?? undefined)

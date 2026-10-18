@@ -9,6 +9,7 @@ import { credentialRef } from '@deepseek-ai/dsh-credentials'
 // 依赖底层,从它导入即断环。
 import { fetchWithRetry, looksLikeSecretHeaderValue, readJsonBounded } from './net.js'
 import { ALIYUN_BALANCE_CREDENTIAL_VARS, queryAliyunBalance } from './aliyun-balance.js'
+import { TOKENRHYTHM_BALANCE_CREDENTIAL_VARS, queryTokenRhythmBalance } from './tokenrhythm-balance.js'
 // 复用网关层的 loopback 判定(issue #87 v1.7.25+):本机回环端点(如
 // dsh-workbuddy-connect 的 /plugins/.../status)只监听 127.0.0.1,不提供 TLS,
 // 与 gatewayQuotas 同口径放行明文 http;非回环主机仍强制 https。
@@ -19,6 +20,7 @@ export const CUSTOM_BALANCE_ADAPTER_ID = 'custom'
 
 export function customBalanceCredentialVars(entry) {
   if (entry?.adapter === 'aliyun') return [...ALIYUN_BALANCE_CREDENTIAL_VARS]
+  if (entry?.adapter === 'tokenrhythm') return [...TOKENRHYTHM_BALANCE_CREDENTIAL_VARS]
   return [...new Set(Object.values(entry?.request?.headers ?? {}).flatMap(value =>
     typeof value === 'string' ? [...value.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)].map(match => match[1]) : []))]
 }
@@ -148,14 +150,16 @@ const warnedHosts = new Set()
  * @param {import('cordis').Context} ctx
  * @param {Record<string, unknown>} config
  */
-export async function queryCustomBalance(ctx, config) {
+export async function queryCustomBalance(ctx, config, { signal } = {}) {
+  signal?.throwIfAborted()
   const custom = config?.customBalance
   if (custom?.enabled !== true) {
     const error = new Error('custom balance disabled')
     error.soft = true
     throw error
   }
-  if (custom.adapter === 'aliyun') return queryAliyunBalance(ctx, config)
+  if (custom.adapter === 'aliyun') return queryAliyunBalance(ctx, config, { signal })
+  if (custom.adapter === 'tokenrhythm') return queryTokenRhythmBalance(ctx, config, { signal })
   const request = custom.request
   if (request === null || typeof request !== 'object' || typeof request.url !== 'string' || request.url.length === 0) {
     throw new Error('customBalance.request.url is required')
@@ -203,10 +207,10 @@ export async function queryCustomBalance(ctx, config) {
   }
   const method = typeof request.method === 'string' ? request.method.toUpperCase() : 'GET'
   const headers = await resolveHeaders(rawHeaders, ctx)
-  const init = { method, headers, redirect: 'manual' }
+  const init = { method, headers, redirect: 'manual', signal }
   if (method !== 'GET' && method !== 'HEAD' && request.body !== undefined) {
     init.body = typeof request.body === 'string' ? request.body : JSON.stringify(request.body)
-    if (!headers['content-type'] && !headers['Content-Type']) {
+    if (!Object.keys(headers).some(name => name.toLowerCase() === 'content-type')) {
       init.headers = { ...headers, 'content-type': 'application/json' }
     }
   }
@@ -215,6 +219,7 @@ export async function queryCustomBalance(ctx, config) {
   // 目标主机,一次跨源重定向就足以把密钥发去别处;遇到重定向直接报错。
   const response = await fetchWithRetry(request.url, init, { timeoutMs: 15000 })
   if (response.status >= 300 && response.status < 400) {
+    try { await response.body?.cancel?.() } catch {}
     throw new Error(`custom balance endpoint redirected (HTTP ${String(response.status)}); redirects are refused to avoid forwarding credentials to another host`)
   }
   if (!response.ok) {

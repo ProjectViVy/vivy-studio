@@ -3,10 +3,12 @@
  * 宿主的 parentSession 也用于普通 fork,只有 origin=subagent 的连续链才属于子代理。
  */
 
-const FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning', 'calls', 'cost', 'apiCost']
+import { FX_FIELDS } from './exchange-rates.js'
+const FIELDS = ['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning', 'calls', 'cost', 'apiCost', ...FX_FIELDS]
 const amount = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : 0
 const validId = value => typeof value === 'string' && value.length > 0 && value.length <= 512
 const emptyBuckets = () => Object.fromEntries(FIELDS.map(key => [key, 0]))
+const headerReads = new WeakMap()
 
 function empty(id) {
   return { id, ...emptyBuckets(), byProviderModel: {} }
@@ -45,20 +47,35 @@ export async function readSessionHeaders(ctx) {
     }
   }
   const get = name => { try { return ctx?.get?.(name) } catch { return undefined } }
-  let listed = false
-  const query = get('sessionQuery')
-  if (typeof query?.listSessions === 'function') {
-    try {
-      const records = await query.listSessions()
-      if (Array.isArray(records)) { accept(records); listed = true }
-    } catch { /* 单次目录故障不影响主会话费用;尝试旧版持久化接口。 */ }
+  const query = get('sessionQuery'), persistence = get('sessionPersistence')
+  let cached = ctx && typeof ctx === 'object' ? headerReads.get(ctx) : null
+  if (!cached || cached.query !== query || cached.persistence !== persistence) {
+    cached = { query, persistence, at: 0, rows: null, pending: null }
+    if (ctx && typeof ctx === 'object') headerReads.set(ctx, cached)
   }
-  if (!listed) {
-    const persistence = get('sessionPersistence')
-    if (typeof persistence?.list === 'function') {
-      try { accept(await persistence.list()) } catch { /* 无持久化目录时仍可使用 live 会话。 */ }
+  // The badge, overview, and call page often ask for the same persisted directory
+  // together. Share one read; live headers are still merged on every invocation.
+  if (!cached.pending && (!cached.rows || Date.now() - cached.at >= 5000)) cached.pending = (async () => {
+    let listed = false
+    const persisted = new Map(), collect = records => {
+      if (!Array.isArray(records)) return
+      for (const record of records) { const header = cleanHeader(record?.header ?? record); if (header) persisted.set(header.id, header) }
     }
-  }
+    if (typeof query?.listSessions === 'function') {
+      try {
+        const records = await query.listSessions()
+        if (Array.isArray(records)) { collect(records); listed = true }
+      } catch { /* 单次目录故障不影响主会话费用;尝试旧版持久化接口。 */ }
+    }
+    if (!listed) {
+      if (typeof persistence?.list === 'function') {
+        try { const records = await persistence.list(); if (Array.isArray(records)) { collect(records); listed = true } } catch { /* 无持久化目录时仍可使用 live 会话。 */ }
+      }
+    }
+    if (listed) { cached.rows = [...persisted.values()]; cached.at = Date.now() }
+  })().finally(() => { cached.pending = null })
+  if (cached.pending) await cached.pending
+  accept(cached.rows)
   const sessions = get('sessions') ?? ctx?.sessions
   if (typeof sessions?.list === 'function') {
     try { accept(sessions.list()) } catch { /* 兼容没有会话目录服务的旧宿主。 */ }
@@ -114,4 +131,51 @@ export async function getSessionCost(ledger, ctx, sessionId) {
   const include = ledger.config?.includeSubagentCost === true
   const headers = include ? await readSessionHeaders(ctx) : []
   return aggregateSessionCost(ledger.days, sessionId, headers, include)
+}
+
+/** One scope shared by the badge, selected-conversation statistics and log details. */
+export async function sessionCostIds(ledger, ctx, sessionId) {
+  if (!validId(sessionId)) throw new Error('invalid session id')
+  return new Set([sessionId, ...(ledger.config?.includeSubagentCost === true
+    ? subagentIds(sessionId, await readSessionHeaders(ctx)) : [])])
+}
+
+/** Assign each agent to one top-level conversation; forks and broken/cyclic chains stay separate. */
+export function conversationOwners(headers, ids = []) {
+  const byId = new Map((headers ?? []).map(raw => cleanHeader(raw?.header ?? raw)).filter(Boolean).map(row => [row.id, row]))
+  const known = new Set([...ids, ...byId.keys()]), owners = new Map()
+  for (const id of known) {
+    let current = id
+    const seen = new Set([id])
+    for (;;) {
+      const row = byId.get(current)
+      if (row?.origin !== 'subagent' || !known.has(row.parentSession)) break
+      if (seen.has(row.parentSession)) { current = id; break }
+      current = row.parentSession
+      seen.add(current)
+    }
+    owners.set(id, current)
+  }
+  return owners
+}
+
+/** One row per conversation across all dates, with each agent included exactly once. */
+export function conversationRows(days, headers = [], include = false) {
+  const source = Object.entries(days ?? {}).sort(([a], [b]) => a.localeCompare(b)).flatMap(([date, day]) =>
+    (day.sessions ?? []).filter(row => validId(row?.id)).map(row => ({ ...row, date })))
+  const owners = include ? conversationOwners(headers, source.map(row => row.id)) : new Map()
+  const rows = new Map()
+  let recent = 0
+  for (const raw of source) {
+    const id = owners.get(raw.id) ?? raw.id
+    let row = rows.get(id)
+    if (!row) { row = { ...empty(id), date: raw.date }; rows.set(id, row) }
+    addSession(row, raw)
+    if (raw.id === id) {
+      if (raw.title) row.title = raw.title
+      if (amount(raw.at)) row.at = row.at ? Math.min(row.at, raw.at) : raw.at
+    }
+    row.recent = recent++
+  }
+  return [...rows.values()]
 }

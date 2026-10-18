@@ -5,29 +5,41 @@
  * 原子重命名,并做防抖;账本按 config.historyDays 保留最近 N 天。
  */
 
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { FX_FIELDS, frozenAmounts, frozenFields, addFrozen, freezeLegacyAmounts, fxRatesOf } from './exchange-rates.js'
+import { readFileSync, renameSync, statSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
+import { validRequestFee } from './web-request-pricing.js'
+import { repairDailySessionTotals } from './ledger-totals.js'
+import { withLedgerLock, readLedger, writeLedger, applyAccount, mergeLedger, mergeRuntimeConfig, cleanUsageCursors } from './ledger-persistence.js'
+import { normalizePricingHistory, advancePricingHistory, bindPricingHistory, pricingConfigAt } from './billing-history.js'
+import { join } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import {
   DEFAULT_PEAK_EFFECTIVE_AT,
   DEFAULT_PEAK_WINDOWS,
+  DEFAULT_PEAK_HOLIDAYS,
   DEFAULT_PRICE_TABLE,
   DEFAULT_PRICE_TABLE_CNY,
   DEFAULT_PROVIDER_PRICE_TABLE,
+  upgradeProviderPriceDefaults,
+  upgradeProviderPriceCatalog20261015,
+  upgradeStepfunPriceCatalog,
   costOf,
   normalizePrice,
   priceEntryFor,
   providerPriceEntryFor,
+  normalizeCustomPrice,
   usdFromCost,
   isWrapperProviderId,
   wrapperUpstreamProvider,
   isLocalOriginProviderOrModel,
 } from './pricing.js'
 import { CODING_PLAN_PROVIDER_IDS, normalizeMiniMaxBaseUrl } from './coding-plans.js'
-import { DEFAULT_PLAN_PROVIDER_CLASS, PLAN_PROVIDER_IDS, billingClassOf, enabledPlanSetOf, planProviderIdOf, appendHourBucket, pruneHourBuckets, convertRecentCallsToBuckets, isRoutedThirdPartyCall } from './plan-billing.js'
+import { normalizeFactoryOrgId } from './factory-quota.js'
+import { normalizeOpenDesignWorkspace } from './opendesign.js'
+import { DEFAULT_PLAN_PROVIDER_CLASS, PLAN_PROVIDER_IDS, billingClassOf, enabledPlanSetOf, planProviderIdOf, convertRecentCallsToBuckets, isRoutedThirdPartyCall } from './plan-billing.js'
 
 const LEDGER_VERSION = 1
-const MAX_SESSIONS_PER_DAY = 200
 const DEFAULT_HISTORY_DAYS = 180
 const GATEWAY_PROVIDER_IDS = ['antigravity', 'claude', 'codex', 'kimi', 'xai', 'workbuddy']
 const GATEWAY_DISPLAY_VALUES = ['sidebar', 'settings', 'both', 'off']
@@ -122,11 +134,16 @@ export function defaultConfig() {
     currency: 'CNY', // CNY | USD | EUR | custom
     symbol: '¥',
     decimals: 4,
+    exchangeRateAuto: true,
+    fxRates: { USD: 1, CNY: 7.2, EUR: 0.92 },
+    exchangeRateCheckedAt: 0,
+    exchangeRateDate: '',
     exchangeRate: 7.2, // 展示层:美元 → 币种汇率
     pricingCurrency: 'USD', // 官方价格币种(issue #47):USD(美元官方价) | CNY(人民币官方价,计费按汇率折算入账)
     peakEnabled: true, // 启用峰谷计价
     peakEffectiveAt: DEFAULT_PEAK_EFFECTIVE_AT,
     peakWindows: DEFAULT_PEAK_WINDOWS.map(w => ({ ...w })),
+    peakHolidays: [...DEFAULT_PEAK_HOLIDAYS], // 北京日历日；调休上班的周末仍按全天谷价
     peakNotice: true, // 峰时高价时段显著提示(侧边栏预算框/今日费用/设置页预算面板)
     peakAlertEnabled: true, // 峰/谷切换前弹窗提醒(全局浮层)
     peakAlertAhead: 2, // 提前提醒量(分钟,1-30)
@@ -135,17 +152,27 @@ export function defaultConfig() {
     peakAlertWebNotify: false, // 弹窗时额外发浏览器(系统)通知,需用户在地址栏授权
     showSessionId: false, // 会话列表中附显会话 ID(默认只显示标题,需要时开启)
     hideOfficialBalance: false, // 隐藏官方账户余额(issue #45):开启后侧边栏/会话页/设置页的官方余额 UI 整体不渲染
+    hideBudget: false, // Hide the sidebar budget card without disabling budget tracking.
     hideTodayCost: false, // 隐藏今日消耗金额(issue #46):开启后侧栏今日费用行/预算明细今日行/概览今日卡片不渲染
+    hideSessionCostHeader: false,
+    hideSessionCostDock: false,
+    hideTurnCost: false,
+    sessionCostCompact: false, // 输入区下方会话费用行只显示金额(悬停 title 与费用明细弹窗保留完整分项)
+    contextCostsEnabled: false,
+    contextCostsPromptSeen: false,
+    statisticsBasis: 'auto', // 未选择时沿用全局 API / 含 Plan 口径。
+    sidebarTodayMetric: 'cost',
     showTotalWithPlan: false, // 「含 Plan 总额」全局开关(v1.6.0):开启后全部金额展示按总等值(cost)计;默认按真金白银(apiCost)
     includeSubagentCost: false, // 本会话展示可合并连续子代理后代;不重复写入每日账本。
     codexQuotaEnabled: false, // Codex 额度按需开启,避免未使用 Codex 时显示卡片或查询。
+    codexQuotaSidebar: true, // 独立控制侧栏卡片，保留会话额度条。
     sidebarSimple: false,
     sidebarSimplePromptSeen: false,
     sidebarModels: { enabled: false, period: 'today', topN: 5, summary: 'total', position: 'last', defaultOpen: false, remember: true, tokens: false, shares: true, refreshSeconds: 60, dock: false },
     sidebarStyle: 'standard', // 侧边栏进度条样式:standard(标准,纵向单列) | compact(紧凑,额度卡两列网格)
     legacyAutoImportedAt: 0, // 安装前历史自动导入标记(issue #27):完成时刻 ms;0 = 尚未跑过
     peakStyle: 'compact', // 峰谷时段条样式:compact(简洁单行/竖向同构) | classic(经典分段/胶囊芯片)
-    priceMatch: 'auto', // 未知模型名自动匹配价格表:auto(去后缀/前缀/家族相似) | exact(仅精确)
+    priceMatch: 'auto', // 未知模型名自动匹配价格表:auto(归一化/安全后缀) | exact(仅精确)
     priceMatchDismissed: [], // 从匹配设置中移除的 provider:model 行；不删除用量或改变计价规则。
     priceOverrides: {}, // 手动匹配覆盖:{ 'provider:modelId': 'provider:模型 | deepseek:__default__' };裸模型名 = 同渠道换名(旧版遗留,跨渠道裸 DeepSeek 名由查价兜底自愈,issue #56)
     priceTableDisplay: {}, // 费用设置直接显示(按模型):键 'provider:modelId' → 布尔;缺省 = DeepSeek 模型直接显示、第三方收入拓展价格表(含 DeepSeek 模型也可逐模型收入)
@@ -169,6 +196,8 @@ export function defaultConfig() {
       detail: true, // 预算图框详细信息:今日费用与占预算% + 已用/额度行
     },
     codingPlans: {
+      opendesign: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '', workspaceId: '' },
+      factory: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '', orgId: '', factoryPool: 'standard' },
       // 各家 coding plan 额度查询(默认关闭;开启后按 Key 发现链查询并在设置页展示)。
       anthropic: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '' },
       zai: { enabled: false, display: 'settings', refreshMinutes: 15, apiKey: '' },
@@ -208,6 +237,7 @@ export function defaultConfig() {
       labelEn: '',
       display: 'both',
       unit: 'USD',
+      convertToDisplayCurrency: false,
       refreshMinutes: 15,
       request: {
         url: '',
@@ -260,6 +290,7 @@ export function defaultConfig() {
       // providers 值:auto(跟随该家启用开关)| plan | api;models 为 provider:model 级覆盖。
       providers: { ...DEFAULT_PLAN_PROVIDER_CLASS },
       models: {},
+      modelPlans: {},
     },
     historyDays: DEFAULT_HISTORY_DAYS,
     fetchedAt: null, // 最近一次官方价格同步时间(ISO)
@@ -283,8 +314,8 @@ export function zeroDay(date) {
 /**
  * 聚合某日账本中归属 DeepSeek 官方渠道的费用(USD;issue #36)。
  * 只累加 byProviderModel 里 provider 前缀为官方渠道的条目:'deepseek'(账本记账时
- * 未标注 provider 的调用归入此键)与 'deepseek-official'(profile 内置官方路由的
- * 实际 provider id,实测账本键形如 deepseek-official:deepseek-v4-flash);Coding
+ * 未标注 provider 的调用归入此键)、'deepseek-official'(API Key 路由)与
+ * 'deepseek-account'(Desktop 登录账号路由);Coding
  * Plan / 自定义 Provider / go、zen 等第三方网关不计入。
  * 无按渠道拆分的旧数据(byProviderModel 缺失/为空)退回全量 cost,保持升级前行为。
  * @param day - 单日账本记录(可能为 undefined)。
@@ -300,7 +331,7 @@ export function officialCostOfDay(day) {
     // 宿主包装路由(llm-deepseek 等)与裸名同义:剥前缀后再按官方渠道判定,
     // 与 providerPriceEntryFor / planProviderIdOf 的 llm- 剥离同口径。
     if (provider.startsWith('llm-')) provider = provider.slice(4)
-    if (provider !== 'deepseek' && provider !== 'deepseek-official') continue
+    if (!/^deepseek(?:-official|-account)?$/.test(provider)) continue
     sum += Number(value?.cost) || 0
   }
   return sum
@@ -372,6 +403,19 @@ export function splitLedgerApiCost(ledger) {
       if (sessChanged) touched += 1
     }
   }
+  // Reclassification changes API attribution, while each currency keeps its recorded totals.
+  for (const day of Object.values(ledger.days ?? {})) for (const row of [day, ...(day.sessions ?? [])]) {
+    const buckets = Object.entries(row.byProviderModel ?? {})
+    for (const suffix of ['Cny', 'Eur']) {
+      let total = 0, api = 0
+      for (const [key, bucket] of buckets) {
+        if (!Number.isFinite(bucket['cost' + suffix])) continue
+        bucket['apiCost' + suffix] = keyClass(key) === 'api' ? bucket['cost' + suffix] : 0
+        total += bucket['cost' + suffix]; api += bucket['apiCost' + suffix]
+      }
+      if (Number.isFinite(row['cost' + suffix])) row['apiCost' + suffix] = Math.min(row['cost' + suffix], api + Math.max(0, row['cost' + suffix] - total))
+    }
+  }
   return touched
 }
 
@@ -382,9 +426,10 @@ export function splitLedgerApiCost(ledger) {
  * 逐 byProviderModel 桶按当前价格表重算(flat 模型与峰谷无关，DeepSeek
  * 档按日中午近似，容差 10% 以内不扰动，避免峰时抖动误伤)。
  * 同时按新 planBilling 重算 apiCost。
+ * @param accepts - 可选桶筛选器；定向迁移只修改命中的 provider:model 与费用。
  * @returns { touchedDays, touchedSessions, recostedBuckets }
  */
-export function repairLedgerPricing(ledger) {
+export function repairLedgerPricing(ledger, accepts = () => true) {
   const enabledPlans = enabledPlanSetOf(ledger.config)
   const planBilling = ledger.config.planBilling
   const prices = ledger.config.prices
@@ -402,6 +447,7 @@ export function repairLedgerPricing(ledger) {
     let dayChanged = false
     for (const [key, bucket] of Object.entries(day.byProviderModel ?? {})) {
       if (bucket === null || typeof bucket !== 'object') continue
+      if (!accepts(key, bucket)) continue
       const sep = key.indexOf(':')
       const provider = sep >= 0 ? key.slice(0, sep) : 'deepseek'
       const model = sep >= 0 ? key.slice(sep + 1) : key
@@ -412,9 +458,9 @@ export function repairLedgerPricing(ledger) {
       // 仅修复 flat 模型的误配，deepseek-peak 依赖峰时判定，近似 noon 易误伤
       // 按单次请求上下文分档的模型不能用日聚合 token 猜档位;保留已记成本,
       // 只允许完整请求日志回放重算,否则多次短请求合计会误套长上下文价格。
-      if (resolved.billingMode === 'deepseek-peak' || resolved.entry.longContext) continue
+      if (['deepseek-peak', 'utc-peak'].includes(resolved.billingMode) || resolved.entry.longContext) continue
       const priced = costOf(tokens, resolved.entry, atMsSafe, { enabled: false })
-      const newCost = usdFromCost(priced, 'USD', ledger.config.exchangeRate)
+      const newCost = usdFromCost(priced, resolved.currency, ledger.config.exchangeRate)
       const oldCost = Number(bucket.cost) || 0
       if (!Number.isFinite(newCost) || Math.abs(newCost - oldCost) < 1e-9) continue
       const absDiff = Math.abs(newCost - oldCost)
@@ -445,6 +491,7 @@ export function repairLedgerPricing(ledger) {
         let sessApiDelta = 0
         let sessChanged = false
         for (const [key, bucket] of Object.entries(session.byProviderModel ?? {})) {
+          if (bucket === null || typeof bucket !== 'object' || !accepts(key, bucket)) continue
           const sep = key.indexOf(':')
           const provider = sep >= 0 ? key.slice(0, sep) : 'deepseek'
           const model = sep >= 0 ? key.slice(sep + 1) : key
@@ -452,9 +499,9 @@ export function repairLedgerPricing(ledger) {
           if ((tokens.input + tokens.output + tokens.cacheRead + tokens.cacheWrite + tokens.reasoning) === 0) continue
           const resolved = providerPriceEntryFor(provider, model, ledger.config.prices, priceOpts)
           if (!resolved.priced || resolved.entry === null) continue
-          if (resolved.billingMode === 'deepseek-peak' || resolved.entry.longContext) continue
+          if (['deepseek-peak', 'utc-peak'].includes(resolved.billingMode) || resolved.entry.longContext) continue
           const priced = costOf(tokens, resolved.entry, sessAtMs, { enabled: false })
-          const newCost = usdFromCost(priced, 'USD', ledger.config.exchangeRate)
+          const newCost = usdFromCost(priced, resolved.currency, ledger.config.exchangeRate)
           const oldCost = Number(bucket.cost) || 0
           if (!Number.isFinite(newCost) || Math.abs(newCost - oldCost) < 1e-9) continue
           const absDiff = Math.abs(newCost - oldCost)
@@ -630,10 +677,6 @@ export function dedupeWrapperProviderDays(days) {
   return result
 }
 
-function zeroSession(id) {
-  return { id, input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, calls: 0, cost: 0, apiCost: 0, byProviderModel: {} }
-}
-
 /** 账本数值清洗:非有限/负数(含历史版本写入的 null)一律归 0,防止污染聚合并击穿 Typert strict codec。 */
 function sanitizeNum(value) {
   const n = Number(value)
@@ -723,6 +766,7 @@ const VALIDATION_MESSAGES = {
     peakEnabled: 'peakEnabled 必须是布尔值',
     peakEffectiveAt: 'peakEffectiveAt 非法',
     peakWindows: 'peakWindows 必须是数组',
+    peakHolidays: 'peakHolidays 必须是至多 366 个 YYYY-MM-DD 北京日期',
     peakNotice: 'peakNotice 必须是布尔值',
     peakAlertEnabled: 'peakAlertEnabled 必须是布尔值',
     peakAlertAhead: 'peakAlertAhead 必须是 1-30 的整数',
@@ -731,10 +775,12 @@ const VALIDATION_MESSAGES = {
     peakAlertWebNotify: 'peakAlertWebNotify 必须是布尔值',
     showSessionId: 'showSessionId 必须是布尔值',
     hideOfficialBalance: 'hideOfficialBalance 必须是布尔值',
+    hideBudget: 'hideBudget 必须是布尔值',
     hideTodayCost: 'hideTodayCost 必须是布尔值',
     showTotalWithPlan: 'showTotalWithPlan 必须是布尔值',
     includeSubagentCost: 'includeSubagentCost 必须是布尔值',
     codexQuotaEnabled: 'codexQuotaEnabled 必须是布尔值',
+    codexQuotaSidebar: 'codexQuotaSidebar 必须是布尔值',
     sidebarSimple: '简化显示设置必须是布尔值',
     sidebarModels: '模型花费卡片设置无效：Top-N 为 1–10，刷新间隔为 10–60 秒',
     sidebarStyle: 'sidebarStyle 必须是 standard / compact',
@@ -761,13 +807,14 @@ const VALIDATION_MESSAGES = {
     balanceBudgetCap: 'balance.budgetCap 必须是非负数或 null',
     goQuota: 'goQuota 非法',
     customBalance: 'customBalance 非法',
-    customBalanceAdapter: 'customBalance.adapter 必须是 custom / aliyun',
+    customBalanceAdapter: 'customBalance.adapter 必须是 custom / aliyun / tokenrhythm',
     customBalanceEnabled: 'customBalance.enabled 必须是布尔值',
     customBalanceDisplay: 'customBalance.display 必须是 sidebar / settings / both / off',
     customBalanceRefresh: 'customBalance.refreshMinutes 必须是 1-1440 的整数',
     customBalanceLabel: 'customBalance.label 必须是字符串',
     customBalanceLabelEn: 'customBalance.labelEn 必须是字符串',
     customBalanceUnit: 'customBalance.unit 必须是 USD / CNY / EUR / CREDITS',
+    customBalanceConvert: 'customBalance.convertToDisplayCurrency 必须是布尔值',
     customBalanceRequest: 'customBalance.request.url 必须是非空字符串',
     customBalanceHeaders: 'customBalance.request.headers 必须是字符串→字符串映射',
     customBalanceExtract: 'customBalance.extract 必须是对象',
@@ -825,6 +872,7 @@ const VALIDATION_MESSAGES = {
     peakEnabled: 'peakEnabled must be a boolean',
     peakEffectiveAt: 'Invalid peakEffectiveAt',
     peakWindows: 'peakWindows must be an array',
+    peakHolidays: 'peakHolidays must contain at most 366 valid YYYY-MM-DD dates',
     peakNotice: 'peakNotice must be a boolean',
     peakAlertEnabled: 'peakAlertEnabled must be a boolean',
     peakAlertAhead: 'peakAlertAhead must be an integer between 1 and 30',
@@ -833,10 +881,12 @@ const VALIDATION_MESSAGES = {
     peakAlertWebNotify: 'peakAlertWebNotify must be a boolean',
     showSessionId: 'showSessionId must be a boolean',
     hideOfficialBalance: 'hideOfficialBalance must be a boolean',
+    hideBudget: 'hideBudget must be a boolean',
     hideTodayCost: 'hideTodayCost must be a boolean',
     showTotalWithPlan: 'showTotalWithPlan must be a boolean',
     includeSubagentCost: 'includeSubagentCost must be a boolean',
     codexQuotaEnabled: 'codexQuotaEnabled must be a boolean',
+    codexQuotaSidebar: 'codexQuotaSidebar must be a boolean',
     sidebarSimple: 'Simple display settings must be boolean',
     sidebarModels: 'Invalid model cost card settings: Top-N must be 1–10 and refresh interval 10–60 seconds',
     sidebarStyle: 'sidebarStyle must be standard / compact',
@@ -863,13 +913,14 @@ const VALIDATION_MESSAGES = {
     balanceBudgetCap: 'balance.budgetCap must be a non-negative number or null',
     goQuota: 'Invalid goQuota',
     customBalance: 'Invalid customBalance',
-    customBalanceAdapter: 'customBalance.adapter must be custom / aliyun',
+    customBalanceAdapter: 'customBalance.adapter must be custom / aliyun / tokenrhythm',
     customBalanceEnabled: 'customBalance.enabled must be a boolean',
     customBalanceDisplay: 'customBalance.display must be sidebar / settings / both / off',
     customBalanceRefresh: 'customBalance.refreshMinutes must be an integer from 1 to 1440',
     customBalanceLabel: 'customBalance.label must be a string',
     customBalanceLabelEn: 'customBalance.labelEn must be a string',
     customBalanceUnit: 'customBalance.unit must be USD / CNY / EUR / CREDITS',
+    customBalanceConvert: 'customBalance.convertToDisplayCurrency must be a boolean',
     customBalanceRequest: 'customBalance.request.url must be a non-empty string',
     customBalanceHeaders: 'customBalance.request.headers must be a string→string map',
     customBalanceExtract: 'customBalance.extract must be an object',
@@ -1022,6 +1073,7 @@ export function applyConfigPatch(current, rawPatch) {
   // prices.models 是可编辑列表:客户端提交完整列表时必须按替换语义处理，
   // 否则 mergeDeep 会把已删除的旧模型重新合并回来。
   if (patch.prices !== null && typeof patch.prices === 'object' && !Array.isArray(patch.prices)) {
+    if (Object.hasOwn(patch.prices, 'custom')) candidate.prices.custom = structuredClone(patch.prices.custom)
     // 默认价卡片也是完整记录，清空某档位时不能被深合并复活。
     const defaultPatch = patch.prices.default
     if (defaultPatch && ['cacheHit', 'cacheMiss', 'output'].every(key => Object.hasOwn(defaultPatch, key))) {
@@ -1060,6 +1112,17 @@ export function applyConfigPatch(current, rawPatch) {
     const minutes = Number(entry.refreshMinutes)
     entry.refreshMinutes = Number.isFinite(minutes) && minutes >= 1 && minutes <= 1440 ? minutes : 15
     entry.apiKey = typeof entry.apiKey === 'string' ? entry.apiKey : ''
+    if (id === 'opendesign') {
+      const workspace = normalizeOpenDesignWorkspace(entry.workspaceId)
+      if (workspace === null) errors.push(locale === 'zh' ? 'OpenDesign 工作区 ID 格式无效。' : 'Invalid OpenDesign workspace ID.')
+      else entry.workspaceId = workspace
+    }
+    if (id === 'factory') {
+      const org = normalizeFactoryOrgId(entry.orgId)
+      if (org === null) errors.push(locale === 'zh' ? 'Factory 组织 ID 格式无效。' : 'Invalid Factory organization ID.')
+      else entry.orgId = org
+      entry.factoryPool = ['standard', 'core', 'both'].includes(entry.factoryPool) ? entry.factoryPool : 'standard'
+    }
     if (id === 'minimax') {
       const origin = normalizeMiniMaxBaseUrl(entry.baseUrl)
       if (origin === null) errors.push(locale === 'zh' ? 'MiniMax 查询域名必须是 HTTPS 地址，仅含主机和可选端口，不含路径、账号、查询参数或片段。' : 'MiniMax quota origin must use HTTPS with only a host and optional port; no path, credentials, query or fragment.')
@@ -1074,7 +1137,7 @@ export function applyConfigPatch(current, rawPatch) {
     // 千问 Token Plan 本地计量专用字段(issue #78):月度 Credits 额度、订阅起始日
     // 与抵扣率覆盖(归一模型名 → { input, cachedInput, output },仅正有限数保留)。
     if (id === 'qwen') {
-      entry.quotaSource = entry.quotaSource === 'cli' ? 'cli' : 'local'
+      entry.quotaSource = entry.quotaSource === 'cli' || entry.quotaSource === 'bailian' ? entry.quotaSource : 'local'
       const credits = Number(entry.planCredits)
       entry.planCredits = Number.isFinite(credits) && credits > 0 ? credits : 500000
       entry.planStart = typeof entry.planStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry.planStart) ? entry.planStart : ''
@@ -1111,6 +1174,7 @@ export function applyConfigPatch(current, rawPatch) {
   if (typeof candidate.symbol !== 'string') errors.push(vmsg(locale, 'symbol'))
   const decimals = Number(candidate.decimals)
   if (!Number.isInteger(decimals) || decimals < 0 || decimals > 10) errors.push(vmsg(locale, 'decimals'))
+  if (typeof candidate.exchangeRateAuto !== 'boolean') errors.push('exchangeRateAuto must be boolean')
   const rate = Number(candidate.exchangeRate)
   if (!Number.isFinite(rate) || rate <= 0) errors.push(vmsg(locale, 'exchangeRate'))
   // 官方价格币种(issue #47):决定「同步官方价格」抓美元页还是人民币页。
@@ -1118,6 +1182,7 @@ export function applyConfigPatch(current, rawPatch) {
   if (typeof candidate.peakEnabled !== 'boolean') errors.push(vmsg(locale, 'peakEnabled'))
   if (typeof candidate.peakEffectiveAt !== 'string' || Number.isNaN(Date.parse(candidate.peakEffectiveAt))) errors.push(vmsg(locale, 'peakEffectiveAt'))
   if (!Array.isArray(candidate.peakWindows)) errors.push(vmsg(locale, 'peakWindows'))
+  if (!Array.isArray(candidate.peakHolidays) || candidate.peakHolidays.length > 366 || candidate.peakHolidays.some(date => typeof date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(date + 'T00:00:00Z')) || new Date(date + 'T00:00:00Z').toISOString().slice(0, 10) !== date)) errors.push(vmsg(locale, 'peakHolidays'))
   if (typeof candidate.peakNotice !== 'boolean') errors.push(vmsg(locale, 'peakNotice'))
   // 峰/谷切换前弹窗提醒:开关可缺省(默认开);提前量 1-30 分钟;类型三选一。
   if (candidate.peakAlertEnabled !== undefined && typeof candidate.peakAlertEnabled !== 'boolean') errors.push(vmsg(locale, 'peakAlertEnabled'))
@@ -1129,10 +1194,19 @@ export function applyConfigPatch(current, rawPatch) {
   if (candidate.showSessionId !== undefined && typeof candidate.showSessionId !== 'boolean') errors.push(vmsg(locale, 'showSessionId'))
   // UI 隐藏开关(issues #45/#46):布尔,可缺省(默认关);开启后对应区块整体不渲染。
   if (candidate.hideOfficialBalance !== undefined && typeof candidate.hideOfficialBalance !== 'boolean') errors.push(vmsg(locale, 'hideOfficialBalance'))
+  if (candidate.hideBudget !== undefined && typeof candidate.hideBudget !== 'boolean') errors.push(vmsg(locale, 'hideBudget'))
   if (candidate.hideTodayCost !== undefined && typeof candidate.hideTodayCost !== 'boolean') errors.push(vmsg(locale, 'hideTodayCost'))
+  for (const key of ['hideSessionCostHeader', 'hideSessionCostDock', 'hideTurnCost']) {
+    if (candidate[key] !== undefined && typeof candidate[key] !== 'boolean') errors.push(locale === 'en' ? `${key} must be a boolean` : `${key} 必须是布尔值`)
+  }
+  // 会话费用行紧凑模式:布尔,可缺省(默认关)。
+  if (candidate.sessionCostCompact !== undefined && typeof candidate.sessionCostCompact !== 'boolean') errors.push(locale === 'en' ? 'sessionCostCompact must be a boolean' : 'sessionCostCompact 必须是布尔值')
+  for (const key of ['contextCostsEnabled', 'contextCostsPromptSeen']) if (candidate[key] !== undefined && typeof candidate[key] !== 'boolean') errors.push(key + ' must be a boolean')
+  if (candidate.sidebarTodayMetric !== undefined && !['cost', 'tokens'].includes(candidate.sidebarTodayMetric)) errors.push('sidebarTodayMetric must be cost or tokens')
   // 「含 Plan 总额」全局开关(v1.6.0):布尔,可缺省(默认关)。
+  if (candidate.statisticsBasis !== undefined && !['auto', 'api', 'plan', 'total'].includes(candidate.statisticsBasis)) errors.push('statisticsBasis must be auto, api, plan or total')
   if (candidate.showTotalWithPlan !== undefined && typeof candidate.showTotalWithPlan !== 'boolean') errors.push(vmsg(locale, 'showTotalWithPlan'))
-  for (const field of ['includeSubagentCost', 'codexQuotaEnabled']) {
+  for (const field of ['includeSubagentCost', 'codexQuotaEnabled', 'codexQuotaSidebar']) {
     if (candidate[field] !== undefined && typeof candidate[field] !== 'boolean') errors.push(vmsg(locale, field))
   }
   // 侧边栏进度条样式:standard(默认,纵向单列) | compact(额度卡两列网格)。
@@ -1218,7 +1292,7 @@ export function applyConfigPatch(current, rawPatch) {
       return
     }
     if (typeof entry.enabled !== 'boolean') errors.push(vmsg(locale, fieldPrefix + 'Enabled'))
-    if (entry.adapter !== undefined && !['custom', 'aliyun'].includes(entry.adapter)) errors.push(vmsg(locale, fieldPrefix + 'Adapter'))
+    if (entry.adapter !== undefined && !['custom', 'aliyun', 'tokenrhythm'].includes(entry.adapter)) errors.push(vmsg(locale, fieldPrefix + 'Adapter'))
     if (!['sidebar', 'settings', 'both', 'off'].includes(entry.display)) errors.push(vmsg(locale, fieldPrefix + 'Display'))
     const refreshMinutes = Number(entry.refreshMinutes)
     if (!Number.isInteger(refreshMinutes) || refreshMinutes < 1 || refreshMinutes > 1440) errors.push(vmsg(locale, fieldPrefix + 'Refresh'))
@@ -1226,6 +1300,7 @@ export function applyConfigPatch(current, rawPatch) {
     if (typeof entry.label !== 'string') errors.push(vmsg(locale, fieldPrefix + 'Label'))
     if (entry.labelEn !== undefined && typeof entry.labelEn !== 'string') errors.push(vmsg(locale, fieldPrefix + 'LabelEn'))
     if (entry.unit !== undefined && !['USD', 'CNY', 'EUR', 'CREDITS'].includes(entry.unit)) errors.push(vmsg(locale, fieldPrefix + 'Unit'))
+    if (entry.convertToDisplayCurrency !== undefined && typeof entry.convertToDisplayCurrency !== 'boolean') errors.push(vmsg(locale, fieldPrefix + 'Convert'))
     const request = entry.request
     // url 仅在启用时必填:默认禁用状态下不能阻断其它配置项的保存。
     if (request === null || typeof request !== 'object' || Array.isArray(request) || typeof request.url !== 'string' || (entry.enabled === true && request.url.length === 0)) {
@@ -1367,6 +1442,11 @@ export function applyConfigPatch(current, rawPatch) {
       || Object.entries(modelsIn).some(([k, v]) => typeof k !== 'string' || k.length === 0 || !['auto', 'plan', 'api'].includes(v))) {
       errors.push(vmsg(locale, 'planBillingModel'))
     }
+    const assignments = planBilling.modelPlans
+    if (assignments !== undefined && (assignments === null || typeof assignments !== 'object' || Array.isArray(assignments)
+      || Object.entries(assignments).some(([key, value]) => !key.includes(':') || !PLAN_PROVIDER_IDS.includes(value)))) {
+      errors.push(vmsg(locale, 'planBillingModel'))
+    }
   }
   // 价格表规范化。
   const prices = candidate.prices
@@ -1374,6 +1454,14 @@ export function applyConfigPatch(current, rawPatch) {
     errors.push(vmsg(locale, 'prices'))
   } else {
     // 价表币种标记(issue #47):fetchPrices 写入,计费按此决定是否折算;缺省 = USD。
+    if (prices.custom !== undefined) {
+      if (!prices.custom || typeof prices.custom !== 'object' || Array.isArray(prices.custom)) errors.push(vmsg(locale, 'prices'))
+      else for (const [key, raw] of Object.entries(prices.custom)) {
+        const entry = normalizeCustomPrice(raw)
+        if (!key.includes(':') || key.length > 512 || entry === null) errors.push(vmsg(locale, 'modelPrice', { id: key }))
+        else prices.custom[key] = entry
+      }
+    }
     if (prices.currency !== undefined && prices.currency !== 'USD' && prices.currency !== 'CNY') {
       errors.push(vmsg(locale, 'pricesCurrency'))
     }
@@ -1422,6 +1510,15 @@ export function sanitizeConfig(raw) {
     base.prices = { ...base.prices, ...structuredClone(DEFAULT_PRICE_TABLE_CNY), currency: 'CNY' }
   }
   const out = mergeDeep(base, cfg)
+  if (cfg.prices?.custom !== undefined) out.prices.custom = Object.fromEntries(Object.entries(
+    cfg.prices.custom && typeof cfg.prices.custom === 'object' && !Array.isArray(cfg.prices.custom) ? cfg.prices.custom : {},
+  ).filter(([key, raw]) => key.includes(':') && key.length <= 512 && normalizeCustomPrice(raw) !== null).map(([key, raw]) => [key, normalizeCustomPrice(raw)]))
+  // 第三方模型列表也遵循完整替换语义；重启不能复活取消挂载的模型，
+  // 也不能把默认缓存折扣/长档混进用户手写价。新增目录由一次性迁移补齐。
+  for (const [provider, table] of Object.entries(cfg.prices?.providers ?? {})) {
+    if (!table?.models || typeof table.models !== 'object' || Array.isArray(table.models)) continue
+    if (Object.hasOwn(out.prices?.providers ?? {}, provider)) out.prices.providers[provider].models = mergeDeep({}, table.models)
+  }
   // 与 RPC 的完整列表替换语义一致：不能把新默认表的美元历史价混进旧人民币记录，
   // 也不能在重启时复活用户已取消挂载的模型。升级由带标记的启动迁移完成。
   const storedModels = cfg.prices?.models
@@ -1464,10 +1561,18 @@ export function sanitizeConfig(raw) {
   out.historyDays = Math.max(7, Math.min(3650, Math.floor(Number(out.historyDays) || 180)))
   out.showSessionId = out.showSessionId === true
   out.hideOfficialBalance = out.hideOfficialBalance === true
+  out.hideBudget = out.hideBudget === true
   out.hideTodayCost = out.hideTodayCost === true
+  for (const key of ['hideSessionCostHeader', 'hideSessionCostDock', 'hideTurnCost']) out[key] = out[key] === true
+  out.sessionCostCompact = out.sessionCostCompact === true
+  out.contextCostsEnabled = out.contextCostsEnabled === true
+  out.contextCostsPromptSeen = out.contextCostsPromptSeen === true
+  out.sidebarTodayMetric = oneOf(out.sidebarTodayMetric, ['cost', 'tokens'], 'cost')
+  out.statisticsBasis = ['api', 'plan', 'total'].includes(out.statisticsBasis) ? out.statisticsBasis : 'auto'
   out.showTotalWithPlan = out.showTotalWithPlan === true
   out.includeSubagentCost = out.includeSubagentCost === true
   out.codexQuotaEnabled = out.codexQuotaEnabled === true
+  out.codexQuotaSidebar = out.codexQuotaSidebar !== false
   out.sidebarSimple = out.sidebarSimple === true
   out.sidebarSimplePromptSeen = out.sidebarSimplePromptSeen === true
   out.sidebarModels = Object.fromEntries(Object.entries(base.sidebarModels).map(([k, fallback]) => {
@@ -1491,9 +1596,15 @@ export function sanitizeConfig(raw) {
   out.peakAlertWebNotify = out.peakAlertWebNotify === true
   // 安装前历史自动导入标记:有限正数保留,否则归零(下次启动重试)。
   out.legacyAutoImportedAt = isNum(Number(out.legacyAutoImportedAt)) && Number(out.legacyAutoImportedAt) > 0 ? Number(out.legacyAutoImportedAt) : 0
+  out.exchangeRateAuto = out.exchangeRateAuto !== false
+  out.fxRates = fxRatesOf(out)
+  out.exchangeRateCheckedAt = Number.isFinite(out.exchangeRateCheckedAt) && out.exchangeRateCheckedAt > 0 ? out.exchangeRateCheckedAt : 0
+  out.exchangeRateDate = /^\d{4}-\d{2}-\d{2}$/.test(out.exchangeRateDate ?? '') ? out.exchangeRateDate : ''
   if (!isNum(out.exchangeRate) || out.exchangeRate <= 0) out.exchangeRate = base.exchangeRate
   if (!Array.isArray(out.peakWindows)) out.peakWindows = base.peakWindows
   else out.peakWindows = out.peakWindows.filter(w => w !== null && typeof w === 'object' && isNum(Number(w.start)) && isNum(Number(w.end)))
+  if (!Array.isArray(out.peakHolidays)) out.peakHolidays = base.peakHolidays
+  else out.peakHolidays = [...new Set(out.peakHolidays.filter(date => typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) && !Number.isNaN(Date.parse(date + 'T00:00:00Z')) && new Date(date + 'T00:00:00Z').toISOString().slice(0, 10) === date))].slice(0, 366).sort()
   // 峰谷生效时刻:不可解析的时间串回落默认(account() 的 Date.parse 会得 NaN,静默禁用「生效前按基础价」规则)。
   if (Number.isNaN(Date.parse(out.peakEffectiveAt))) out.peakEffectiveAt = base.peakEffectiveAt
   // priceOverrides:仅保留字符串→字符串。
@@ -1543,13 +1654,14 @@ export function sanitizeConfig(raw) {
   const sanitizeCustomEntry = (raw, baseEntry) => {
     const entry = raw ?? {}
     const clean = {
-      ...(entry.adapter === 'aliyun' ? { adapter: 'aliyun' } : {}),
+      ...(['aliyun', 'tokenrhythm'].includes(entry.adapter) ? { adapter: entry.adapter } : {}),
       enabled: entry.enabled === true,
       display: oneOf(entry.display, ['sidebar', 'settings', 'both', 'off'], 'both'),
       refreshMinutes: Math.min(1440, Math.max(1, Math.floor(Number(entry.refreshMinutes) || 15))),
       label: typeof entry.label === 'string' ? entry.label : baseEntry.label,
       labelEn: typeof entry.labelEn === 'string' ? entry.labelEn : baseEntry.labelEn,
-      unit: oneOf(entry.unit, ['USD', 'CNY', 'EUR', 'CREDITS'], baseEntry.unit),
+      unit: entry.adapter === 'tokenrhythm' ? 'CNY' : oneOf(entry.unit, ['USD', 'CNY', 'EUR', 'CREDITS'], baseEntry.unit),
+      convertToDisplayCurrency: entry.convertToDisplayCurrency === true,
     }
     if (entry.request === null || typeof entry.request !== 'object' || Array.isArray(entry.request)) {
       clean.request = { ...baseEntry.request }
@@ -1645,13 +1757,24 @@ export function sanitizeConfig(raw) {
         plans[id].baseUrl = origin ?? ''
         if (origin === null) plans[id].enabled = false // 无效磁盘配置不能悄悄向默认站点发送 Key。
       }
+      if (id === 'opendesign') {
+        const workspace = normalizeOpenDesignWorkspace(entry.workspaceId)
+        plans[id].workspaceId = workspace ?? ''
+        if (workspace === null) plans[id].enabled = false
+      }
+      if (id === 'factory') {
+        const org = normalizeFactoryOrgId(entry.orgId)
+        plans[id].orgId = org ?? ''
+        if (org === null) plans[id].enabled = false
+        plans[id].factoryPool = oneOf(entry.factoryPool, ['standard', 'core', 'both'], 'standard')
+      }
       if (id === 'scnet') {
         const credits = Number(entry.planCredits)
         plans[id].planCredits = Number.isFinite(credits) && credits > 0 ? credits : 240000
         plans[id].planStart = typeof entry.planStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry.planStart) ? entry.planStart : ''
       }
       if (id === 'qwen') {
-        plans[id].quotaSource = entry.quotaSource === 'cli' ? 'cli' : 'local'
+        plans[id].quotaSource = entry.quotaSource === 'cli' || entry.quotaSource === 'bailian' ? entry.quotaSource : 'local'
         const credits = Number(entry.planCredits)
         plans[id].planCredits = Number.isFinite(credits) && credits > 0 ? credits : 500000
         plans[id].planStart = typeof entry.planStart === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry.planStart) ? entry.planStart : ''
@@ -1690,13 +1813,8 @@ export function sanitizeConfig(raw) {
       if (typeof k === 'string' && k.length > 0 && (v === 'plan' || v === 'api')) pbModels[k] = v
     }
   }
-  out.planBilling = { providers: pbProviders, models: pbModels }
-  // 目录迁移(v1.5.2):opencode-go 中的 DeepSeek V4 模型与官方主表重复,以官方为准,从旧账本挂载中剔除。
-  const goModels = out.prices?.providers?.['opencode-go']?.models
-  if (goModels !== null && typeof goModels === 'object') {
-    delete goModels['deepseek-v4-flash']
-    delete goModels['deepseek-v4-pro']
-  }
+  const modelPlans = Object.fromEntries(Object.entries(out.planBilling?.modelPlans ?? {}).filter(([key, value]) => key.includes(':') && PLAN_PROVIDER_IDS.includes(value)))
+  out.planBilling = { providers: pbProviders, models: pbModels, modelPlans }
   return out
 }
 
@@ -1721,6 +1839,7 @@ export function sanitizeConfig(raw) {
  * 其遗留 apiKey 字段由 stripSecrets 直接清空。
  */
 const SECRET_REF_MAP = {
+  balance: 'DEEPSEEK_BALANCE_API_KEY',
   goQuota: 'OPENCODE_GO_API_KEY',
   'codingPlans.anthropic': 'ANTHROPIC_OAUTH_TOKEN',
   'codingPlans.zai': 'ZAI_API_KEY',
@@ -1731,6 +1850,8 @@ const SECRET_REF_MAP = {
   'codingPlans.commandcode': 'COMMANDCODE_API_KEY',
   'codingPlans.volcengine.ak': 'VOLC_ACCESSKEY',
   'codingPlans.volcengine.sk': 'VOLC_SECRETKEY',
+  'codingPlans.mimo': 'MIMO_COOKIE',
+  'codingPlans.factory': 'FACTORY_API_KEY',
 }
 
 /** 可由凭据库托管的密钥目标清单(顺序即 UI 展示与迁移处理顺序)。 */
@@ -1894,6 +2015,9 @@ export function stripSecrets(cfg) {
  * 只处理「旧版本无对应配置项、行为与新版本语义不符」的场景;迁移在 sanitizeConfig 之前对原始配置执行。
  */
 const CONFIG_MIGRATIONS = [
+  { id: 'provider-catalog-2026-10-03', apply: upgradeProviderPriceDefaults },
+  { id: 'provider-catalog-2026-10-15', apply: upgradeProviderPriceCatalog20261015 },
+  { id: 'stepfun-catalog-2026-10-16', apply: upgradeStepfunPriceCatalog },
   {
     id: 'v1.5.26-coding-plan-sidebar-display',
     // v1.5.26 前 coding plan 无显示位置 UI:MiniMax 启用即在侧边栏展示卡片,而 schema 恒把 display
@@ -1918,14 +2042,21 @@ export class Ledger {
    * @param extras - 可选持久化附加状态({ planSamples, planHourBuckets })。
    */
   constructor(config, days, path, migrations = [], extras = {}) {
+    this.pricingHistory = normalizePricingHistory(extras.pricingHistory, config)
     this.config = config
+    freezeLegacyAmounts(days, config)
     this.days = days
     this.path = path
     this.writeTimer = null
     this.closed = false
     this.pendingWrite = false
-    // 余额差对账参考点({ date, total, granted, topped, at }),由 open() 载入、flush() 落盘。
-    this.balanceRef = null
+    this.diskRevision = null
+    // 余额差对账参考点及同期账本费用(ledgerCost),由 open() 载入、flush() 落盘。
+    this.balanceRef = extras.balanceRef ?? null
+    this.historyReset = extras.historyReset ?? null
+    this.usageCursors = cleanUsageCursors(extras.usageCursors)
+    this.pendingAccounts = []
+    this.pendingPlanHourRepairs = []
     this.migrations = Array.isArray(migrations) ? migrations.filter(m => typeof m === 'string') : []
     // 存量密钥迁移状态(v1.6.8,**不落盘**):{ ran, pending }。由 runSecretMigration 写入、
     // buildState 读取,用于在 UI 提示未能自动导入凭据库的密钥。
@@ -1933,27 +2064,55 @@ export class Ledger {
     // Plan 百分比采样历史与 provider×小时聚合桶(issue #64;v1.5.52 起小时桶取代环形缓冲)。
     this.planSamples = extras.planSamples ?? {}
     this.planHourBuckets = extras.planHourBuckets ?? {}
+    // 自动目录上次写入的价格指纹：重启后仍能识别用户手改价格，不下发到客户端。
+    this.openrouterPriceHashes = Object.fromEntries(Object.entries(extras.openrouterPriceHashes ?? {})
+      .filter(([key, value]) => !['__proto__', 'constructor', 'prototype'].includes(key) && typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))
+    this.providerPriceHashes = Object.fromEntries(Object.entries(extras.providerPriceHashes ?? {})
+      .filter(([key, value]) => key.startsWith('opendesign:') && typeof value === 'string' && /^[a-f0-9]{64}$/.test(value)))
+    this.writeBase = this.snapshot()
+  }
+
+  get config() { return this._config }
+  set config(value) {
+    if (this.pricingHistory) advancePricingHistory(this.pricingHistory, value)
+    this._config = bindPricingHistory(value, this.pricingHistory)
   }
 
   /** 在 $DSH_HOME 下创建/加载账本。 */
   static open() {
     const root = join(resolveDshHome(), 'storages', 'cost-meter')
     const path = join(root, 'ledger.json')
+    return withLedgerLock(path, () => Ledger.load(path))
+  }
+
+  static load(path) {
     let config = defaultConfig()
     let days = {}
     let balanceRef = null
-    let migrations = []
+    let migrations = CONFIG_MIGRATIONS.map(migration => migration.id)
     let planSamples = {}
     let planHourBuckets = {}
+    let openrouterPriceHashes = {}
+    let providerPriceHashes = {}
+    let historyReset = null
+    let usageCursors = {}
+    let pricingHistory
     try {
       const parsed = JSON.parse(readFileSync(path, 'utf8'))
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('Unsupported ledger format')
+      }
       if (parsed !== null && typeof parsed === 'object') {
         if (parsed.version !== LEDGER_VERSION) {
           // 先把旧文件改名留存,再按空账本启动:防止下一次 flush 直接覆盖销毁历史。
           try { renameSync(path, `${path}.corrupt-${Date.now()}`) } catch {}
           console.warn(`[dsh-cost-meter] 账本版本 ${String(parsed.version)} 不受支持,按空账本启动`)
         } else {
+          historyReset = parsed.historyReset ?? null
+          usageCursors = cleanUsageCursors(parsed.usageCursors)
           const cfg = typeof parsed.config === 'object' && parsed.config !== null ? parsed.config : {}
+          // Freeze the installed table before a catalog migration changes it.
+          pricingHistory = normalizePricingHistory(parsed.pricingHistory, sanitizeConfig(cfg))
           // 一次性迁移:先于清洗对原始配置执行,已应用过的(账本 migrations 标记)跳过。
           migrations = Array.isArray(parsed.migrations) ? parsed.migrations.filter(m => typeof m === 'string') : []
           const applied = new Set(migrations)
@@ -1964,6 +2123,8 @@ export class Ledger {
           }
           // 新版本新增的配置键用默认值补齐;非法值清洗回落,防止击穿 strict codec。
           config = sanitizeConfig(cfg)
+          if (parsed.openrouterPriceHashes && typeof parsed.openrouterPriceHashes === 'object' && !Array.isArray(parsed.openrouterPriceHashes)) openrouterPriceHashes = parsed.openrouterPriceHashes
+          if (parsed.providerPriceHashes && typeof parsed.providerPriceHashes === 'object' && !Array.isArray(parsed.providerPriceHashes)) providerPriceHashes = parsed.providerPriceHashes
           if (parsed.days !== null && typeof parsed.days === 'object' && !Array.isArray(parsed.days)) {
             // 旧账本可能含 reasoning: null 等非法数值:清洗后再入内存,并触发回写覆盖。
             days = sanitizeDays(parsed.days)
@@ -1974,7 +2135,8 @@ export class Ledger {
             && Number.isFinite(ref.total) && Number.isFinite(ref.granted) && Number.isFinite(ref.topped)) {
             // 旧账本无 currency 字段:保留 undefined,与新版首次拉取币种不等,
             // reconcile 时自然重置基准一次(旧参考点可能录自 USD 0.00 误读,不可信)。
-            balanceRef = { date: ref.date, total: ref.total, granted: ref.granted, topped: ref.topped, currency: typeof ref.currency === 'string' ? ref.currency : undefined, at: Number(ref.at) || 0 }
+            balanceRef = { date: ref.date, total: ref.total, granted: ref.granted, topped: ref.topped, currency: typeof ref.currency === 'string' ? ref.currency : undefined, at: Number(ref.at) || 0,
+              ledgerCost: Number.isFinite(ref.ledgerCost) && ref.ledgerCost >= 0 ? ref.ledgerCost : undefined }
           }
           // Plan 采样历史与小时聚合桶(issue #64):形状不对则丢弃重建;
           // v1.5.51 的环形缓冲(planRecentCalls 数组)一次性转换为小时桶。
@@ -1995,8 +2157,12 @@ export class Ledger {
         console.warn(`[dsh-cost-meter] 账本读取失败,按空账本启动: ${String(error?.message ?? error)}`)
       }
     }
-    const ledger = new Ledger(config, days, path, migrations, { planSamples, planHourBuckets })
-    ledger.balanceRef = balanceRef
+    const ledger = new Ledger(config, days, path, migrations, { planSamples, planHourBuckets, openrouterPriceHashes, providerPriceHashes, balanceRef, historyReset, usageCursors, pricingHistory })
+    const repaired = repairDailySessionTotals(ledger.days)
+    if (repaired.length) {
+      if (repaired.includes(ledger.balanceRef?.date)) ledger.balanceRef = null
+      ledger.scheduleWrite()
+    }
     return ledger
   }
 
@@ -2007,30 +2173,31 @@ export class Ledger {
    * @param sessionId - 会话 id(可能缺失,例如无会话的辅助调用)。
    * @param atMs - 计费时刻(epoch ms)。
    */
-  account(tokens, modelId, sessionId, atMs, provider) {
+  account(tokens, modelId, sessionId, atMs, provider, meter, requestFee) {
     if (this.closed) return
-    const resolved = providerPriceEntryFor(provider, modelId, this.config.prices, {
-      mode: this.config.priceMatch === 'exact' ? 'exact' : 'auto',
-      overrides: this.config.priceOverrides,
+    if (requestFee !== undefined && (!validRequestFee(requestFee) || provider !== 'deepseek-official' || modelId !== `deepseek-web-${requestFee.kind}`)) throw new Error('Invalid official web request fee')
+    const pricing = pricingConfigAt(this.config, atMs, sessionId, `${provider || 'deepseek'}:${modelId}`)
+    const resolved = providerPriceEntryFor(provider, modelId, pricing.prices, {
+      mode: pricing.priceMatch === 'exact' ? 'exact' : 'auto',
+      overrides: pricing.priceOverrides,
     })
     const entry = resolved.entry ?? { cacheHit: 0, cacheMiss: 0, output: 0 }
     const peak = {
-      enabled: resolved.billingMode === 'deepseek-peak' && this.config.peakEnabled === true,
-      effectiveAtMs: Date.parse(this.config.peakEffectiveAt),
-      windows: this.config.peakWindows,
+      enabled: ['deepseek-peak', 'utc-peak'].includes(resolved.billingMode) && pricing.peakEnabled === true,
+      effectiveAtMs: Date.parse(pricing.peakEffectiveAt),
+      windows: pricing.peakWindows,
+      holidays: pricing.peakHolidays,
     }
     // 官方价格币种为人民币(issue #47)时,DeepSeek 主表(峰谷计费,含 default
     // 兜底与跨厂商兑底命中)计出的成本为人民币,按展示汇率折算为美元入账;
     // 第三方 flat 恒为美元价,直接入账。
-    const priced = resolved.priced ? costOf(tokens, entry, atMs, peak) : 0
-    const cost = usdFromCost(priced,
-      resolved.billingMode === 'deepseek-peak' && this.config.prices?.currency === 'CNY' ? 'CNY' : 'USD',
-      this.config.exchangeRate)
+    const priced = requestFee ? requestFee.requests * requestFee.rateCny : resolved.priced ? costOf(tokens, entry, atMs, peak) : 0
+    const cost = usdFromCost(priced, requestFee ? 'CNY' : resolved.currency, fxRatesOf(pricing).CNY)
     // Plan/API 双轨分类(issue #64):plan 类调用金额只记等值(cost),apiCost 记真金白银部分;
     // Plan 类调用同时进入 provider×小时聚合桶(供 5 小时滚动窗本地量聚合)。
     const planBilling = this.config.planBilling
     const enabledPlans = enabledPlanSetOf(this.config)
-    const cls = billingClassOf(provider, modelId, planBilling, enabledPlans, this.config.prices)
+    const cls = requestFee ? 'api' : billingClassOf(provider, modelId, planBilling, enabledPlans, this.config.prices)
     const apiCost = cls === 'api' ? cost : 0
     // 归一化各桶 token 数:非有限/负数一律按 0 处理,防止污染账本聚合。
     const num = value => {
@@ -2044,75 +2211,26 @@ export class Ledger {
       cacheWrite: num(tokens?.cacheWrite),
       reasoning: num(tokens?.reasoning),
     }
-    const date = localDayKey(atMs)
-    let day = this.days[date]
-    if (day === undefined || day === null || typeof day !== 'object') {
-      day = zeroDay(date)
-      this.days[date] = day
+    const planId = cls === 'plan' ? (planProviderIdOf(provider, planBilling, modelId)
+      ?? (isRoutedThirdPartyCall(provider, modelId, this.config.prices) ? 'go' : null)) : null
+    const call = {
+      ...(meter ? { meter } : {}),
+      date: localDayKey(atMs), sessionId, atMs, recordedAt: Date.now(), planId,
+      providerKey: `${typeof provider === 'string' && provider.length > 0 ? provider : 'deepseek'}:${String(modelId ?? 'default')}`,
+      values: { ...buckets, calls: 1, cost, apiCost, ...frozenAmounts(cost, apiCost, pricing) },
     }
-    day.input += buckets.input
-    day.output += buckets.output
-    day.cacheRead += buckets.cacheRead
-    day.cacheWrite += buckets.cacheWrite
-    day.reasoning += buckets.reasoning
-    day.calls += 1
-    day.cost += cost
-    day.apiCost = (day.apiCost ?? 0) + apiCost
-    const providerKey = `${typeof provider === 'string' && provider.length > 0 ? provider : 'deepseek'}:${String(modelId ?? 'default')}`
-    day.byProviderModel = day.byProviderModel ?? {}
-    const dayProvider = day.byProviderModel[providerKey] ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, calls: 0, cost: 0, apiCost: 0 }
-    day.byProviderModel[providerKey] = {
-      input: dayProvider.input + buckets.input,
-      output: dayProvider.output + buckets.output,
-      cacheRead: dayProvider.cacheRead + buckets.cacheRead,
-      cacheWrite: dayProvider.cacheWrite + buckets.cacheWrite,
-      reasoning: dayProvider.reasoning + buckets.reasoning,
-      calls: dayProvider.calls + 1,
-      cost: dayProvider.cost + cost,
-      apiCost: (dayProvider.apiCost ?? 0) + apiCost,
-    }
-    if (typeof sessionId === 'string' && sessionId.length > 0) {
-      let sessions = Array.isArray(day.sessions) ? day.sessions : []
-      let session = sessions.find(s => s.id === sessionId)
-      if (session === undefined) {
-        session = zeroSession(sessionId)
-        session.at = atMs // 会话首次入账时刻(按会话排行「按时间排序」用)。
-        sessions.push(session)
-        if (sessions.length > MAX_SESSIONS_PER_DAY) sessions = sessions.slice(-MAX_SESSIONS_PER_DAY)
-        day.sessions = sessions
-      }
-      session.input += buckets.input
-      session.output += buckets.output
-      session.cacheRead += buckets.cacheRead
-      session.cacheWrite += buckets.cacheWrite
-      session.reasoning += buckets.reasoning
-      session.calls += 1
-      session.cost += cost
-      session.apiCost = (session.apiCost ?? 0) + apiCost
-      session.byProviderModel = session.byProviderModel ?? {}
-      const sessionProvider = session.byProviderModel[providerKey] ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, calls: 0, cost: 0, apiCost: 0 }
-      session.byProviderModel[providerKey] = {
-        input: sessionProvider.input + buckets.input,
-        output: sessionProvider.output + buckets.output,
-        cacheRead: sessionProvider.cacheRead + buckets.cacheRead,
-        cacheWrite: sessionProvider.cacheWrite + buckets.cacheWrite,
-        reasoning: sessionProvider.reasoning + buckets.reasoning,
-        calls: sessionProvider.calls + 1,
-        cost: sessionProvider.cost + cost,
-        apiCost: (sessionProvider.apiCost ?? 0) + apiCost,
-      }
-    }
-    if (cls === 'plan') {
-      // 路由第三方调用(空/'deepseek' 前缀命中第三方目录)与直连 Plan 同样入小时桶,
-      // 与 aggregateUsageSince 整天段口径一致,否则今日段本地量漏算。
-      const planId = planProviderIdOf(provider)
-        ?? (isRoutedThirdPartyCall(provider, modelId, this.config.prices) ? 'go' : null)
-      if (planId !== null) {
-        this.planHourBuckets = appendHourBucket(this.planHourBuckets, planId, atMs,
-          buckets.input + buckets.output + buckets.cacheRead + buckets.cacheWrite + buckets.reasoning, cost)
-      }
-    }
+    if (!applyAccount(this, call)) return false
+    this.pendingAccounts.push(call)
     this.prune()
+    this.scheduleWrite()
+    return true
+  }
+
+  /** Advance the same atomic receipt for an attempt with no reported usage. */
+  advanceUsageCursor(meter) {
+    const call = { meter, skip: true, recordedAt: Date.now() }
+    if (!applyAccount(this, call)) return
+    this.pendingAccounts.push(call)
     this.scheduleWrite()
   }
 
@@ -2124,6 +2242,7 @@ export class Ledger {
   }
 
   scheduleWrite() {
+    advancePricingHistory(this.pricingHistory, this.config)
     this.pendingWrite = true
     if (this.writeTimer !== null) return
     this.writeTimer = setTimeout(() => {
@@ -2132,27 +2251,98 @@ export class Ledger {
     }, 2000)
   }
 
-  /** 立即落盘(原子写);写失败保留脏标记并按防抖重试(close 之后不再重排)。 */
+  /** A detached, secret-free baseline for merging changes from other processes. */
+  snapshot() {
+    return structuredClone({
+      version: LEDGER_VERSION, config: stripSecrets(this.config), days: this.days,
+      balanceRef: this.balanceRef ?? null, migrations: this.migrations,
+      planSamples: this.planSamples ?? {}, planHourBuckets: this.planHourBuckets ?? {},
+      openrouterPriceHashes: this.openrouterPriceHashes ?? {}, historyReset: this.historyReset ?? null,
+      ...(Object.keys(this.usageCursors).length ? { usageCursors: this.usageCursors } : {}),
+      ...(Object.keys(this.providerPriceHashes).length ? { providerPriceHashes: this.providerPriceHashes } : {}),
+      pricingHistory: this.pricingHistory,
+    })
+  }
+
+  resetHistory() {
+    this.days = {}
+    this.planSamples = {}
+    this.planHourBuckets = {}
+    this.balanceRef = null
+    this.pendingAccounts = []
+    this.pendingPlanHourRepairs = []
+    this.historyReset = { id: randomUUID(), at: Date.now() }
+    this.scheduleWrite()
+  }
+
+  readDiskSnapshot() {
+    const raw = readLedger(this.path)
+    if (raw === null) return null
+    const pricingHistory = normalizePricingHistory(raw.pricingHistory, sanitizeConfig(raw.config))
+    for (const migration of CONFIG_MIGRATIONS) {
+      if (!(raw.migrations ?? []).includes(migration.id)) migration.apply(raw.config ?? {})
+    }
+    return {
+      ...raw, config: stripSecrets(sanitizeConfig(raw.config)),
+      days: sanitizeDays(raw.days ?? {}), balanceRef: raw.balanceRef ?? null,
+      migrations: raw.migrations ?? [], planSamples: raw.planSamples ?? {},
+      planHourBuckets: raw.planHourBuckets ?? convertRecentCallsToBuckets(raw.planRecentCalls ?? []),
+      openrouterPriceHashes: raw.openrouterPriceHashes ?? {}, historyReset: raw.historyReset ?? null,
+      usageCursors: cleanUsageCursors(raw.usageCursors),
+      providerPriceHashes: raw.providerPriceHashes ?? {},
+      pricingHistory,
+    }
+  }
+
+  adoptSnapshot(merged) {
+    this.pricingHistory = normalizePricingHistory(merged.pricingHistory, merged.config)
+    this.config = sanitizeConfig(mergeRuntimeConfig(this.writeBase.config, this.config, merged.config))
+    for (const key of ['days', 'balanceRef', 'migrations', 'planSamples', 'planHourBuckets', 'openrouterPriceHashes', 'historyReset']) this[key] = merged[key]
+    this.usageCursors = cleanUsageCursors(merged.usageCursors)
+    this.providerPriceHashes = merged.providerPriceHashes ?? {}
+  }
+
+  /** Observe another host's atomic write without writing a read-only snapshot back. */
+  refresh() {
+    if (this.closed) return
+    if (this.pendingWrite) { this.flush(); return }
+    try {
+      const info = statSync(this.path, { bigint: true })
+      const revision = `${info.ino}:${info.mtimeNs}:${info.size}`
+      if (revision === this.diskRevision) return
+      const disk = this.readDiskSnapshot()
+      if (disk === null) return
+      this.adoptSnapshot(mergeLedger(this.writeBase, this.snapshot(), disk, []))
+      this.writeBase = structuredClone(disk)
+      this.diskRevision = revision
+    } catch (error) {
+      if (error?.code !== 'ENOENT') console.warn(`[dsh-cost-meter] 账本刷新失败,保留当前记录: ${String(error?.message ?? error)}`)
+    }
+  }
+
+  /** Read, reconcile and atomically replace under one cross-process lock. */
+  repairPlanHours(repairs) {
+    if (this.closed || !repairs.length) return
+    this.pendingPlanHourRepairs.push(...repairs)
+    this.pendingWrite = true
+    this.flush()
+  }
+
   flush() {
     if (!this.pendingWrite || this.closed) return
     try {
-      mkdirSync(dirname(this.path), { recursive: true })
-      // 裁剪结果回写内存:只在持久化副本上裁剪会让内存桶无界增长。
-      this.planHourBuckets = pruneHourBuckets(this.planHourBuckets, Date.now())
-      const tmp = `${this.path}.tmp`
-      writeFileSync(tmp, JSON.stringify({
-        version: LEDGER_VERSION,
-        // 密钥脱敏(v1.6.8):内存中 this.config 仍保留明文供运行时解析(凭据库/环境变量
-        // 都取不到时的兜底),但**绝不写盘**——ledger.json 只存空占位字符串。
-        config: stripSecrets(this.config),
-        days: this.days,
-        balanceRef: this.balanceRef ?? null,
-        migrations: this.migrations,
-        planSamples: this.planSamples ?? {},
-        planHourBuckets: this.planHourBuckets,
-      }), 'utf8')
-      renameSync(tmp, this.path)
-      this.pendingWrite = false
+      withLedgerLock(this.path, () => {
+        const disk = this.readDiskSnapshot()
+        const merged = mergeLedger(this.writeBase, this.snapshot(), disk, this.pendingAccounts, Date.now(), this.pendingPlanHourRepairs)
+        // Keep runtime-only secret fallbacks in memory, never in the file or baseline.
+        writeLedger(this.path, merged)
+        this.adoptSnapshot(merged)
+        this.writeBase = this.snapshot()
+        this.pendingAccounts = []
+        this.pendingPlanHourRepairs = []
+        this.pendingWrite = false
+        this.diskRevision = null
+      })
     } catch (error) {
       console.warn(`[dsh-cost-meter] 账本写入失败,稍后重试: ${String(error?.message ?? error)}`)
       if (!this.closed) this.scheduleWrite()
@@ -2177,11 +2367,13 @@ export class Ledger {
       total.cacheWrite += day.cacheWrite ?? 0
       total.reasoning += day.reasoning ?? 0
       total.calls += day.calls ?? 0
+      addFrozen(total, day)
       total.cost += day.cost ?? 0
       total.apiCost = (total.apiCost ?? 0) + (day.apiCost ?? day.cost ?? 0)
       for (const [key, value] of Object.entries(day.byProviderModel ?? {})) {
         const current = total.byProviderModel[key] ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, calls: 0, cost: 0, apiCost: 0 }
         total.byProviderModel[key] = {
+          ...addFrozen({ ...frozenFields(current) }, value),
           input: current.input + (value.input ?? 0), output: current.output + (value.output ?? 0),
           cacheRead: current.cacheRead + (value.cacheRead ?? 0), cacheWrite: current.cacheWrite + (value.cacheWrite ?? 0),
           reasoning: current.reasoning + (value.reasoning ?? 0),
@@ -2211,11 +2403,13 @@ export class Ledger {
       total.cacheWrite += day.cacheWrite ?? 0
       total.reasoning += day.reasoning ?? 0
       total.calls += day.calls ?? 0
+      addFrozen(total, day)
       total.cost += day.cost ?? 0
       total.apiCost = (total.apiCost ?? 0) + (day.apiCost ?? day.cost ?? 0)
       for (const [key, value] of Object.entries(day.byProviderModel ?? {})) {
         const current = total.byProviderModel[key] ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0, calls: 0, cost: 0, apiCost: 0 }
         total.byProviderModel[key] = {
+          ...addFrozen({ ...frozenFields(current) }, value),
           input: current.input + (value.input ?? 0), output: current.output + (value.output ?? 0),
           cacheRead: current.cacheRead + (value.cacheRead ?? 0), cacheWrite: current.cacheWrite + (value.cacheWrite ?? 0),
           reasoning: current.reasoning + (value.reasoning ?? 0),
@@ -2257,6 +2451,7 @@ export class Ledger {
       ? []
       : day.sessions.slice().sort((a, b) => b.cost - a.cost).map(s => ({ ...s }))
     return {
+      ...frozenFields(day),
       date: String(day.date),
       input: day.input ?? 0,
       output: day.output ?? 0,
@@ -2286,12 +2481,13 @@ export class Ledger {
  * @param dayKey - 本地日期键(YYYY-MM-DD)。
  * @param nowMs - 当前时刻。
  * @param [options] - { exchangeRate }:CNY→USD 折算率(1 USD 兑 X CNY)。
- * @returns {{ ref, event }} event.kind ∈ baseline | structure-reset | flat | ok | drift(drift 携带 spent/spentCurrency/spentUsd/todayCost)。
+ * @returns {{ ref, event }} event.kind ∈ baseline | structure-reset | flat | ok | drift; event.todayCost 是自基准以来的费用增量。
  */
 export function reconcileBalanceDelta(prevRef, balance, todayCost, dayKey, nowMs, options) {
   if (balance === null || typeof balance !== 'object' || !Number.isFinite(balance.totalBalance)) {
     return { ref: prevRef ?? null, event: null }
   }
+  if (!Number.isFinite(todayCost) || todayCost < 0) return { ref: null, event: null }
   const snap = {
     date: dayKey,
     total: balance.totalBalance,
@@ -2299,6 +2495,7 @@ export function reconcileBalanceDelta(prevRef, balance, todayCost, dayKey, nowMs
     topped: Number.isFinite(balance.toppedUpBalance) ? balance.toppedUpBalance : 0,
     currency: typeof balance.currency === 'string' ? balance.currency : '',
     at: nowMs,
+    ledgerCost: todayCost,
   }
   // 新的一天(或首次/参考点形状异常):打基准,不对账。
   if (prevRef === null || typeof prevRef !== 'object' || prevRef.date !== dayKey) {
@@ -2307,6 +2504,10 @@ export function reconcileBalanceDelta(prevRef, balance, todayCost, dayKey, nowMs
   // 币种变化(#24/#25):选中的条目币种切换(或旧参考点无币种标记)时金额不可比,
   // 重置基准不对账——否则 USD 0.00 误读会让余额差虚高,触发 drift 误报。
   if (prevRef.currency !== snap.currency) {
+    return { ref: snap, event: { kind: 'structure-reset' } }
+  }
+  // Legacy references and a cleared/repriced ledger cannot define a comparable interval.
+  if (!Number.isFinite(prevRef.ledgerCost) || prevRef.ledgerCost < 0 || todayCost < prevRef.ledgerCost) {
     return { ref: snap, event: { kind: 'structure-reset' } }
   }
   // 充值/额度授予变动:充值与授信只会让分项余额增加(消费只会减少),分项变大则旧参考点失效,重置不告警。
@@ -2328,6 +2529,7 @@ export function reconcileBalanceDelta(prevRef, balance, todayCost, dayKey, nowMs
   const spentUsd = isCny ? spent / exchangeRate : spent
   // 余额未减少:无法对账(可能整天走订阅扣费),静默。
   if (spent <= 0.009) return { ref: prevRef, event: { kind: 'flat' } }
+  todayCost -= prevRef.ledgerCost
   const dev = Math.abs(spentUsd - todayCost)
   const threshold = Math.max(0.3, 0.15 * Math.max(spentUsd, todayCost))
   if (dev > threshold) return { ref: prevRef, event: { kind: 'drift', spent, spentCurrency: snap.currency, spentUsd, todayCost } }

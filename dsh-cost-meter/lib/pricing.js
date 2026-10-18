@@ -1,3 +1,8 @@
+import { priceMultiplierSettings, multipliedTier, cnyPrice, validPriceMultipliers } from './price-multiplier.js'
+import { VERIFIED_PROVIDER_PRICES, PROVIDER_PRICES_2026_10_03 } from './provider-prices.js'
+import { OPENDESIGN_DEFAULT_PRICES } from './opendesign-prices.js'
+import { OPENDESIGN_PROVIDER_IDS } from './opendesign.js'
+
 /**
  * DeepSeek 官方定价模型:价格表、官方文档解析、计费数学。
  *
@@ -6,9 +11,10 @@
  * 美元价表直接入账;人民币价表的成本经 usdFromCost 按展示汇率折算入账,
  * 展示人民币时汇率往返抵消,与官方人民币账单一致。
  *
- * 2026-09-10 控制台公告更新（USD 交叉核验：DEEPSEEK_USD_PRICE_NOTICE_URL）：
+ * 2026-10-16 核对 DeepSeek 中英文官方价格页：
  * Flash 谷价 CNY 0.02/1/4、USD 0.003/0.15/0.6；峰价两倍。
- * 09-14 12:00 北京时间起 V4 Pro 转按 Flash 价。rateHistory 保留各自生效前价格。
+ * Pro 保持独立价格：CNY 0.15/4.5/13.5、USD 0.022/0.66/1.98；峰价两倍。
+ * 旧 Flash 名称按 Flash 价结算。rateHistory 仅保留 Flash 的已知历史价格。
  * 下列为 2026-08 的历史定价依据，不能用九月新价覆盖这些历史调用：
  *  - 现为纯峰谷两档计价:空闲时段(OFF-PEAK / 空闲时段)价格 = 高峰时段
  *    (PEAK / 高峰时段)价格的一半;
@@ -21,9 +27,9 @@
  *    DEFAULT_PRICE_TABLE_CNY)。
  *  - 峰时段为 01:00-04:00 与 06:00-10:00 UTC(中文页表述为北京时间
  *    9:00-12:00、14:00-18:00,同一窗口),其余为空闲时段;
- *  - 2026-08-23(周日)00:00(北京时间)起:周末(周六及周日,按北京日历)
- *    全天不再区分峰谷,统一按谷价计费;生效前的费用仍按原峰谷规则结算
- *    (官方通知,见 WEEKEND_OFFPEAK_EFFECTIVE_AT);
+ *  - 2026-08-23(周日)00:00(北京时间)起:周末(含调休上班日)全天谷价;
+ *    中国公众假期同样全天谷价。生效前费用仍按原峰谷规则结算
+ *    (官方价格页,见 WEEKEND_OFFPEAK_EFFECTIVE_AT 与 DEFAULT_PEAK_HOLIDAYS);
  *  - 页面已不再列出基础价档与生效时间(两档方案即时生效);本插件把空闲档
  *    同时作为「基础档」存储,未启用峰谷计价时按空闲档计费。
  *  - 页面未单列 cache write 价格,历史定价中 cache write 按 cache hit 计,
@@ -38,10 +44,10 @@
  */
 
 /** 官方定价页(英文版,服务端预渲染,可解析)。 */
-export const OFFICIAL_PRICING_URL = 'https://api-docs.deepseek.com/quick_start/pricing'
+export const OFFICIAL_PRICING_URL = 'https://api-docs.deepseek.com/quick_start/pricing/'
 
 /** 官方定价页(中文版,与英文页同构的峰谷两档表,金额为人民币元)。 */
-export const OFFICIAL_PRICING_URL_ZH = 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing'
+export const OFFICIAL_PRICING_URL_ZH = 'https://api-docs.deepseek.com/zh-cn/quick_start/pricing/'
 
 /** 峰谷计价生效时间(UTC)。两档方案已即时生效:置为过去时刻,门控恒通过。 */
 export const DEFAULT_PEAK_EFFECTIVE_AT = '2026-08-01T00:00:00Z'
@@ -54,10 +60,15 @@ export const DEFAULT_PEAK_EFFECTIVE_AT = '2026-08-01T00:00:00Z'
  */
 export const WEEKEND_OFFPEAK_EFFECTIVE_AT = '2026-08-22T16:00:00Z'
 
-/** 2026-09 控制台公告的两个独立计价边界（北京时间中午 12:00）。 */
+/** 国务院办公厅 2026 年安排中，峰谷规则生效后剩余的中国公众假期（北京日历日）。 */
+export const DEFAULT_PEAK_HOLIDAYS = [
+  '2026-09-25', '2026-09-26', '2026-09-27',
+  '2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04',
+  '2026-10-05', '2026-10-06', '2026-10-07',
+]
+
+/** Flash 历史调价边界（北京时间中午 12:00）；不适用于 Pro。 */
 export const FLASH_PRICE_EFFECTIVE_AT = '2026-09-10T04:00:00Z'
-export const PRO_FLASH_ROUTING_EFFECTIVE_AT = '2026-09-14T04:00:00Z'
-export const DEEPSEEK_USD_PRICE_NOTICE_URL = 'https://intl.cloud.tencent.com/ind/announce/detail/101513'
 
 /**
  * 某一时刻所处的「周末全谷价」区间(北京时间周六/周日,新规生效后)。
@@ -76,6 +87,17 @@ export function weekendZoneAt(atMs) {
   const end = (satDay + 2) * 86400000 - 8 * 3600000
   return { start, end }
 }
+
+/** 中国公众假期的北京时间日区间；调休上班的周末仍由 weekendZoneAt 判为谷价。 */
+export function holidayZoneAt(atMs, holidays = DEFAULT_PEAK_HOLIDAYS) {
+  if (!Number.isFinite(atMs) || atMs < Date.parse(WEEKEND_OFFPEAK_EFFECTIVE_AT) || !Array.isArray(holidays)) return null
+  const day = Math.floor((atMs + 8 * 3600000) / 86400000)
+  const key = new Date(day * 86400000).toISOString().slice(0, 10)
+  if (!holidays.includes(key)) return null
+  return { start: day * 86400000 - 8 * 3600000, end: (day + 1) * 86400000 - 8 * 3600000 }
+}
+
+const offPeakZoneAt = (atMs, holidays) => holidayZoneAt(atMs, holidays) ?? weekendZoneAt(atMs)
 
 /** 峰谷时代分界(2026-08-16 16:00 UTC):此前的计费按当时的基础价执行(历史正确性)。 */
 export const LEGACY_BASE_BOUNDARY = '2026-08-16T16:00:00Z'
@@ -106,7 +128,7 @@ export const DEFAULT_PEAK_WINDOWS = [
 ]
 
 /** 首批人工核对的非 DeepSeek 官方 token 价格(USD / 1M tokens)。 */
-export const DEFAULT_PROVIDER_PRICE_TABLE = {
+const LEGACY_PROVIDER_PRICE_TABLE = {
   openai: {
     models: {
       'gpt-6-astra': { input: 10, cachedInput: 1, cacheWrite: 12.5, output: 50, longContext: { aboveInputTokens: 272000, cacheMiss: 20, cacheHit: 2, cacheWrite: 25, output: 75 }, billingMode: 'flat', sourceUrl: 'https://developers.openai.com/api/docs/models/gpt-6-astra', checkedAt: '2026-09-11', notes: '标准 API 价，OpenCode Zen 同价；完整输入（含缓存读写）超过 272K 时整次请求按长上下文档计费；不含 Batch/Flex/Fast 服务档折扣或倍率' },
@@ -219,8 +241,18 @@ export const DEFAULT_PROVIDER_PRICE_TABLE = {
   },
   xiaomi: {
     models: {
-      'mimo-v2.5': { input: 0.14, cachedInput: 0.0028, output: 0.28, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17' },
-      'mimo-v2.5-pro': { input: 0.435, cachedInput: 0.003625, output: 0.87, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17' },
+      // MiMo V2.6(2026-09-28 官方价目页核对):官方把 2.6 与 2.5 两代并列同价并
+      // 标注 2.5 系即将下线;2.6-pro-ultraspeed 为速度优先档,单价是 pro 的 10 倍。
+      // 三者按官方 USD 价收录(2.6-pro 命中价官方页 $0.0036、Go 目录 $0.003625,
+      // opencode-go 目录随 Go 值);批量推理为实时价一半,官方人民币价一并记入
+      // notes。第三方 flat 条目恒按美元入账(store.account / 实时钩子 / 回放同
+      // 口径),而官方 CNY 与 USD 两套数字各自舍入(pro 系折算率 6.90、flash 系
+      // 7.14),人民币账单精度只能靠展示汇率对齐。
+      'mimo-v2.6-pro': { input: 0.435, cachedInput: 0.0036, output: 0.87, cny: { cacheHit: 0.025, cacheMiss: 3, output: 6 }, billingMode: 'flat', sourceUrl: 'https://mimo.mi.com/docs/zh-CN/price/pay-as-you-go', checkedAt: '2026-09-28', notes: '批量推理按半价' },
+      'mimo-v2.6-flash': { input: 0.14, cachedInput: 0.0028, output: 0.28, cny: { cacheHit: 0.02, cacheMiss: 1, output: 2 }, billingMode: 'flat', sourceUrl: 'https://mimo.mi.com/docs/zh-CN/price/pay-as-you-go', checkedAt: '2026-09-28', notes: '批量推理按半价' },
+      'mimo-v2.6-pro-ultraspeed': { input: 4.35, cachedInput: 0.036, output: 8.7, cny: { cacheHit: 0.25, cacheMiss: 30, output: 60 }, billingMode: 'flat', sourceUrl: 'https://mimo.mi.com/docs/zh-CN/price/pay-as-you-go', checkedAt: '2026-09-28', notes: '速度优先档;官方未提供批量推理档' },
+      'mimo-v2.5': { input: 0.14, cachedInput: 0.0028, output: 0.28, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17', notes: '官方标注即将下线,由 mimo-v2.6-flash 接替' },
+      'mimo-v2.5-pro': { input: 0.435, cachedInput: 0.003625, output: 0.87, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17', notes: '官方标注即将下线,由 mimo-v2.6-pro 接替' },
     },
   },
   upstage: {
@@ -249,7 +281,7 @@ export const DEFAULT_PROVIDER_PRICE_TABLE = {
       'mistral-small-4.0': { input: 0.15, cachedInput: 0.015, output: 0.6, billingMode: 'flat' },
     },
   },
-  // OpenCode Go 订阅($10/月)包含的模型中非 DeepSeek 的 19 个(不含免费档):订阅制下请求
+  // OpenCode Go 订阅($10/月)包含的模型中非 DeepSeek 的部分(不含免费档):订阅制下请求
   // 不按 token 扣费,此处为官方公布的参考单价(用于成本估算/对比),来源 opencode.ai/docs/go。
   // DeepSeek V4 Flash/Pro 与官方主表重复,以官方为准(含峰谷两档),Go 目录不重复收录(v1.5.2 移除)。
   'opencode-go': {
@@ -265,6 +297,10 @@ export const DEFAULT_PROVIDER_PRICE_TABLE = {
       'kimi-k3': { input: 3, cachedInput: 0.3, output: 15, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17' },
       'kimi-k2.7-code': { input: 0.95, cachedInput: 0.19, output: 4, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17' },
       'kimi-k2.6': { input: 0.95, cachedInput: 0.16, output: 4, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17' },
+      // MiMo V2.6-Flash / V2.6-Pro 已在 Go 目录在册(2026-09-28 抓取),与 2.5 系同价;
+      // 速度优先档 Pro UltraSpeed 不在 Go 目录(见 xiaomi 目录,官方价)。
+      'mimo-v2.6-flash': { input: 0.14, cachedInput: 0.0028, output: 0.28, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-09-28' },
+      'mimo-v2.6-pro': { input: 0.435, cachedInput: 0.003625, output: 0.87, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-09-28' },
       'mimo-v2.5': { input: 0.14, cachedInput: 0.0028, output: 0.28, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17' },
       'mimo-v2.5-pro': { input: 0.435, cachedInput: 0.003625, output: 0.87, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17' },
       'minimax-m3': { input: 0.3, cachedInput: 0.06, output: 1.2, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-17' },
@@ -280,13 +316,140 @@ export const DEFAULT_PROVIDER_PRICE_TABLE = {
       'muse-spark-1.2-contributor': { input: 0.1, cachedInput: 0.002, output: 0.2, billingMode: 'flat', sourceUrl: 'https://opencode.ai/docs/go', checkedAt: '2026-08-25', notes: '低价换取提示词/补全用于训练 Meta 模型;限地区' },
     },
   },
+  // OpenRouter 公开目录中的 token 参考价(https://openrouter.ai/api/v1/models)。
+  // 键为 OpenRouter 完整模型 id(含厂商前缀,如 'meta/...'),与账本
+  // 'openrouter:<id>' 精确对应;静态快照(2026-09-17),动态刷新见后续。
+  openrouter: {
+    models: {
+      'meta/muse-spark-1.3-contributor': { input: 0.1, cachedInput: 0.002, output: 0.2, billingMode: 'flat', sourceUrl: 'https://openrouter.ai/api/v1/models', checkedAt: '2026-09-17' },
+      'google/gemini-3.8-flash': { input: 0.75, cachedInput: 0.075, cacheWrite: 0.041667, output: 3.75, billingMode: 'flat', sourceUrl: 'https://openrouter.ai/api/v1/models', checkedAt: '2026-09-17' },
+      'qwen/qwen3.8-flash': { input: 0.15, cachedInput: 0.016, cacheWrite: 0.2, output: 0.47, billingMode: 'flat', sourceUrl: 'https://openrouter.ai/api/v1/models', checkedAt: '2026-09-17' },
+      'z-ai/glm-5.3-flash': { input: 0.09, cachedInput: 0.018, output: 0.3, billingMode: 'flat', sourceUrl: 'https://openrouter.ai/api/v1/models', checkedAt: '2026-09-17' },
+    },
+  },
+}
+
+// 已核对的新目录覆盖内置快照；路由渠道使用自己的完整表，避免把 Zen/Go
+// 参考价当成直接 API 价。同名直接 API 条目只在有官方依据时更新。
+export const LEGACY_GO_MODEL_IDS = Object.freeze(Object.keys(LEGACY_PROVIDER_PRICE_TABLE['opencode-go'].models))
+export const DEFAULT_PROVIDER_PRICE_TABLE = { ...LEGACY_PROVIDER_PRICE_TABLE }
+DEFAULT_PROVIDER_PRICE_TABLE.opendesign = { models: OPENDESIGN_DEFAULT_PRICES }
+for (const [provider, table] of Object.entries(VERIFIED_PROVIDER_PRICES)) {
+  const previous = LEGACY_PROVIDER_PRICE_TABLE[provider]?.models ?? {}
+  DEFAULT_PROVIDER_PRICE_TABLE[provider] = { models: {
+    ...(provider === 'opencode-zen' || provider === 'opencode-go' ? {} : previous), ...table.models,
+  } }
+}
+
+/** One-time upgrade: mount genuinely new IDs and refresh only unchanged legacy defaults.
+ * Missing old IDs are intentional unmounts; custom/unpriced rows and recorded spend stay untouched. */
+export function upgradeProviderPriceDefaults(config, previousCatalog = LEGACY_PROVIDER_PRICE_TABLE) {
+  if (!config || typeof config !== 'object') return
+  config.prices ??= {}
+  if (typeof config.prices !== 'object' || Array.isArray(config.prices)) return
+  config.prices.providers ??= {}
+  if (typeof config.prices.providers !== 'object' || Array.isArray(config.prices.providers)) return
+  const providers = config.prices.providers
+  for (const [provider, table] of Object.entries(DEFAULT_PROVIDER_PRICE_TABLE)) {
+    if (['__proto__', 'constructor', 'prototype'].includes(provider)) continue
+    const legacy = previousCatalog[provider]?.models ?? {}
+    const stored = Object.hasOwn(providers, provider) ? providers[provider]?.models : null
+    if (!stored || typeof stored !== 'object' || Array.isArray(stored)) {
+      if (!Object.hasOwn(providers, provider)) providers[provider] = structuredClone(table)
+      continue
+    }
+    for (const [id, raw] of Object.entries(table.models)) {
+      if (!Object.hasOwn(stored, id)) {
+        if (!Object.hasOwn(legacy, id)) stored[id] = structuredClone(raw)
+        continue
+      }
+      // Normalization intentionally strips optional TTL/extension fields. Their
+      // presence still means a customized row and must not be erased on upgrade.
+      const recognized = new Set(['input', 'cacheMiss', 'cachedInput', 'cacheHit', 'cacheRead', 'cacheWrite', 'output', 'reasoning', 'cny', 'longContext', 'legacy', 'billingMode', 'sourceUrl', 'checkedAt', 'notes', 'offPeak', 'peak', 'legacyBase', 'rateHistory', 'unpriced'])
+      if (stored[id] && Object.keys(stored[id]).some(key => !recognized.has(key))) continue
+      const previous = normalizePrice(legacy[id]), current = normalizePrice(stored[id])
+      if (previous && current && JSON.stringify(previous) === JSON.stringify(current)) stored[id] = structuredClone(raw)
+    }
+  }
+}
+
+/** Refresh the October 3 catalog without restoring removed models or overriding custom prices. */
+export function upgradeProviderPriceCatalog20261015(config) {
+  const previous = Object.fromEntries(Object.keys(DEFAULT_PROVIDER_PRICE_TABLE).map(provider => [provider, { models: {
+    ...(provider === 'opencode-zen' || provider === 'opencode-go' ? {} : LEGACY_PROVIDER_PRICE_TABLE[provider]?.models),
+    ...PROVIDER_PRICES_2026_10_03[provider]?.models,
+  } }]))
+  upgradeProviderPriceDefaults(config, previous)
+}
+
+export function upgradeStepfunPriceCatalog(config) {
+  upgradeProviderPriceDefaults(config, Object.fromEntries(Object.entries(DEFAULT_PROVIDER_PRICE_TABLE).filter(([provider]) => provider !== 'stepfun')))
+}
+
+/** OpenRouter 模型目录接口(公开,无需认证;返回 USD/token 字符串)。
+ *  Phase2 实时刷新源:本地 DEFAULT_PROVIDER_PRICE_TABLE 只保留少量快照
+ *  做离线兜底,启动/手动同步/每小时刷新用它补全全量 openrouter 价。 */
+export const OPENROUTER_MODELS_URL = 'https://openrouter.ai/api/v1/models'
+
+/** 解析 OpenRouter /models 载荷为价目原始条目(USD/百万 token,flat 口径)。
+ *  输入:GET OPENROUTER_MODELS_URL 的 JSON({ data: [{ id, pricing }] });
+ *  输出:{ models: { '<vendor>/<model>': { input, output, cachedInput?, cacheWrite?, billingMode: 'flat', sourceUrl, checkedAt } } }。
+ *  跳过:空 id / 无 pricing / prompt 或 completion 缺失或负数/非数字
+ *  (路由聚合模型如 openrouter/auto 用 prompt:"-1" 占位,无真实单价)。
+ *  可选键只在有限非负数时收录;"0"(免费模型)收录为 0。
+ *  纯函数,无网络 IO,方便 verify.mjs 单测。 */
+export function parseOpenRouterModels(json) {
+  const list = Array.isArray(json?.data) ? json.data : null
+  if (list === null) {
+    // code 供上层按语言渲染提示(见 index.js 的 ERR_NO_MODELS 分支)。
+    const error = new Error('ERR_NO_MODELS')
+    error.code = 'ERR_NO_MODELS'
+    throw error
+  }
+  const rate = (value) => {
+    if ((typeof value !== 'string' && typeof value !== 'number')
+      || (typeof value === 'string' && !/^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i.test(value.trim()))) return undefined
+    const n = Number(value)
+    const scaled = n * 1e6
+    if (!Number.isFinite(scaled) || n < 0) return undefined
+    const rounded = Number(scaled.toFixed(6))
+    return rounded === 0 && scaled > 0 ? Number(scaled.toPrecision(15)) : rounded
+  }
+  const today = new Date().toISOString().slice(0, 10)
+  // USD/token ×1e6 会带浮点尘(如 1e-7*1e6=0.09999999999999999),统一舍到
+  // 6 位小数,与本地快照写法一致,避免价目表出现长尾小数。
+  const models = {}
+  for (const item of list) {
+    if (item === null || typeof item !== 'object') continue
+    const id = typeof item.id === 'string' ? item.id.trim() : ''
+    if (id === '' || id === '__proto__' || id === 'constructor' || id === 'prototype') continue
+    const pricing = item.pricing
+    if (pricing === null || typeof pricing !== 'object' || Array.isArray(pricing)) continue
+    const prompt = rate(pricing.prompt)
+    const completion = rate(pricing.completion)
+    if (prompt === undefined || completion === undefined) continue
+    const raw = {
+      input: prompt,
+      output: completion,
+      billingMode: 'flat',
+      sourceUrl: OPENROUTER_MODELS_URL,
+      checkedAt: today,
+    }
+    const cacheRead = rate(pricing.input_cache_read)
+    if (cacheRead !== undefined) raw.cachedInput = cacheRead
+    const cacheWrite = rate(pricing.input_cache_write)
+    if (cacheWrite !== undefined) raw.cacheWrite = cacheWrite
+    models[id] = raw
+  }
+  if (Object.keys(models).length === 0) throw Object.assign(new Error('ERR_NO_MODELS'), { code: 'ERR_NO_MODELS' })
+  return { models }
 }
 
 /** 拓展价格表目录的模型家族分组(展示用;未列出的模型自成一家)。 */
 export const PROVIDER_MODEL_FAMILIES = {
-  deepseek: { 'deepseek-v4-flash': 'DeepSeek v4', 'deepseek-v4-pro': 'DeepSeek v4', 'deepseek-v4-flash-vision-exp': 'DeepSeek v4', 'deepseek-v4.1-flash': 'DeepSeek v4.1' },
+  deepseek: { 'deepseek-flash': 'DeepSeek v4.1', 'deepseek-v4-flash': 'DeepSeek v4', 'deepseek-v4-pro': 'DeepSeek v4', 'deepseek-v4-flash-vision-exp': 'DeepSeek v4', 'deepseek-v4.1-flash': 'DeepSeek v4.1' },
   openai: {
-    'gpt-6-astra': 'GPT-6 Astra',
+    'gpt-6-astra': 'GPT-6 Astra', 'gpt-6-sol': 'GPT-6', 'gpt-6-luna': 'GPT-6', 'gpt-6.1-sol': 'GPT-6.1',
     'gpt-5.6-sol': 'GPT-5.6', 'gpt-5.6-terra': 'GPT-5.6', 'gpt-5.6-luna': 'GPT-5.6',
     'gpt-5.5': 'GPT-5.5', 'gpt-5.5-pro': 'GPT-5.5',
     'gpt-5.4': 'GPT-5.4', 'gpt-5.4-pro': 'GPT-5.4', 'gpt-5.4-mini': 'GPT-5.4', 'gpt-5.4-nano': 'GPT-5.4',
@@ -297,12 +460,13 @@ export const PROVIDER_MODEL_FAMILIES = {
     'gpt-4.1': 'GPT-4.1', 'gpt-4.1-mini': 'GPT-4.1',
   },
   anthropic: {
-    'claude-fable-5': 'Claude Fable',
+    'claude-fable-5': 'Claude Fable', 'claude-fable-5-1': 'Claude Fable', 'claude-opus-5-5': 'Claude Opus', 'claude-sonnet-5-5': 'Claude Sonnet',
     'claude-opus-5': 'Claude Opus', 'claude-opus-4-8': 'Claude Opus', 'claude-opus-4-7': 'Claude Opus', 'claude-opus-4-6': 'Claude Opus', 'claude-opus-4-5': 'Claude 4.5',
     'claude-sonnet-5': 'Claude Sonnet', 'claude-sonnet-4-6': 'Claude Sonnet', 'claude-sonnet-4-5': 'Claude 4.5',
     'claude-haiku-4-5': 'Claude 4.5',
   },
   google: {
+    'gemini-3.8-flash': 'Gemini 3.8 Flash', 'gemini-3.1-flash-lite': 'Gemini 3.1 Flash',
     'gemini-3.7-flash': 'Gemini 3.7 Flash',
     'gemini-3.6-flash': 'Gemini 3.6 Flash',
     'gemini-3.5-flash': 'Gemini 3.5 Flash', 'gemini-3.5-flash-lite': 'Gemini 3.5 Flash',
@@ -316,15 +480,23 @@ export const PROVIDER_MODEL_FAMILIES = {
   alibaba: { 'qwen3.8-max': 'Qwen3.8', 'qwen3.7-max': 'Qwen3.7', 'qwen3.7-plus': 'Qwen3.7', 'qwen3.6-plus': 'Qwen3.6', 'qwen3.5-plus': 'Qwen3.5', 'qwen3-plus': 'Qwen3' },
   minimax: { 'minimax-m3': 'MiniMax M3', 'minimax-m2.7': 'MiniMax M2', 'minimax-m2.5': 'MiniMax M2' },
   tencent: { 'hunyuan-a13b': '混元', 'hy3': 'Hy3' },
-  xiaomi: { 'mimo-v2.5': 'MiMo V2.5', 'mimo-v2.5-pro': 'MiMo V2.5' },
+  xiaomi: {
+    'mimo-v2.6-pro': 'MiMo V2.6', 'mimo-v2.6-flash': 'MiMo V2.6', 'mimo-v2.6-pro-ultraspeed': 'MiMo V2.6',
+    'mimo-v2.5': 'MiMo V2.5', 'mimo-v2.5-pro': 'MiMo V2.5',
+  },
   upstage: { 'solar-pro4': 'Solar', 'solar-pro3': 'Solar' },
   nvidia: { 'nvidia/nemotron-3-ultra-550b-a55b': 'Nemotron' },
   mistral: { 'mistral-large-2512': 'Mistral Large', 'mistral-medium-3.5': 'Mistral Medium', 'mistral-small-4.0': 'Mistral Small' },
   meta: { 'muse-spark-1.2': 'Muse Spark' },
   meituan: { 'longcat-2.0': 'LongCat' },
+  openrouter: {
+    'meta/muse-spark-1.3-contributor': 'Muse Spark', 'google/gemini-3.8-flash': 'Gemini 3.8 Flash',
+    'qwen/qwen3.8-flash': 'Qwen3.8 Flash', 'z-ai/glm-5.3-flash': 'GLM-5 Flash',
+  },
   'opencode-go': {
     'gpt-5.6-luna': 'GPT', 'grok-4.5': 'Grok', 'glm-5.3': 'GLM', 'glm-5.3-flash': 'GLM Flash', 'glm-5.2': 'GLM', 'glm-5.1': 'GLM',
     'kimi-k3': 'Kimi', 'kimi-k2.7-code': 'Kimi', 'kimi-k2.6': 'Kimi',
+    'mimo-v2.6-pro': 'MiMo', 'mimo-v2.6-flash': 'MiMo',
     'mimo-v2.5': 'MiMo', 'mimo-v2.5-pro': 'MiMo', 'minimax-m3': 'MiniMax', 'minimax-m2.7': 'MiniMax',
     'qwen3.8-max': 'Qwen', 'qwen3.7-max': 'Qwen', 'qwen3.7-plus': 'Qwen', 'qwen3.6-plus': 'Qwen',
     'hy3': 'Hy3', 'longcat-2.0': 'LongCat', 'muse-spark-1.2-contributor': 'Muse Spark',
@@ -449,9 +621,10 @@ function revisedDeepSeekPrice(old, currency, before) {
 function septemberPriceTable(currency) {
   const old = currency === 'CNY' ? AUGUST_PRICE_TABLE_CNY : AUGUST_PRICE_TABLE
   const models = Object.fromEntries(Object.entries(old.models).map(([id, entry]) => [id,
-    revisedDeepSeekPrice(entry, currency, id === 'deepseek-v4-pro' ? PRO_FLASH_ROUTING_EFFECTIVE_AT : FLASH_PRICE_EFFECTIVE_AT)]))
+    id === 'deepseek-v4-pro' ? structuredClone(entry) : revisedDeepSeekPrice(entry, currency, FLASH_PRICE_EFFECTIVE_AT)]))
   // 计价别名；不修改宿主的模型配置，也不声明该 API 名称的可用性。
   models['deepseek-v4.1-flash'] = revisedDeepSeekPrice(old.models['deepseek-v4-flash-vision-exp'], currency, FLASH_PRICE_EFFECTIVE_AT)
+  models['deepseek-flash'] = structuredClone(models['deepseek-v4.1-flash'])
   return { models, default: revisedDeepSeekPrice(old.default, currency, FLASH_PRICE_EFFECTIVE_AT) }
 }
 
@@ -483,12 +656,23 @@ export function upgradeDeepSeekPriceTable(prices) {
   const changed = []
   const update = (object, id, kind) => {
     const entry = object?.[id]
-    if (!entry || entry.billingMode === 'flat' || entry.billingMode === 'batch' || entry.rateHistory !== undefined
-      || (entry.reasoning !== undefined && entry.reasoning !== 0)) return
+    if (!entry || (entry.billingMode && entry.billingMode !== 'deepseek-peak') || entry.unpriced || entry.longContext
+      || entry.cacheWrite !== undefined || entry.cny !== undefined || (entry.reasoning !== undefined && entry.reasoning !== 0)) return
     const oldEntry = kind === 'default' ? old.default : old.models[kind] ?? old.models['deepseek-v4-flash-vision-exp']
     const newEntry = kind === 'default' ? current.default : current.models[kind]
-    if (!matches(entry, oldEntry) && !matches(entry, newEntry)) return
-    object[id] = { ...entry, ...structuredClone(newEntry) }
+    if ([entry.offPeak, entry.peak, entry.legacyBase].some(tier => tier && (tier.cacheWrite !== undefined || (tier.reasoning !== undefined && tier.reasoning !== 0)))
+      || (entry.legacyBase && !matches(entry.legacyBase, oldEntry.legacyBase))) return
+    // #292：只识别旧版本确实写入的错误 Pro 模板，不覆盖用户自定义历史或单价。
+    const history = entry.rateHistory
+    const brokenPro = kind === 'deepseek-v4-pro' && matches(entry, current.default)
+      && Array.isArray(history) && history.length === 1 && history[0].before === '2026-09-14T04:00:00Z'
+      && matches(history[0], oldEntry) && !['cacheWrite', 'reasoning', 'longContext', 'legacyBase', 'rateHistory', 'cny'].some(key => history[0][key] !== undefined)
+    if (history !== undefined && !brokenPro) return
+    if (!brokenPro && !matches(entry, oldEntry) && !matches(entry, newEntry)) return
+    const { rateHistory, ...kept } = entry
+    const next = { ...kept, ...structuredClone(newEntry) }
+    if (JSON.stringify(next) === JSON.stringify(entry)) return
+    object[id] = next
     changed.push(id)
   }
   for (const id of Object.keys(prices.models ?? {})) {
@@ -496,7 +680,8 @@ export function upgradeDeepSeekPriceTable(prices) {
     const kind = model.startsWith('deepseekv4pro') ? 'deepseek-v4-pro'
       : model.startsWith('deepseekv41flash') ? 'deepseek-v4.1-flash'
       : model.startsWith('deepseekv4flashvision') ? 'deepseek-v4-flash-vision-exp'
-      : model.startsWith('deepseekv4flash') ? 'deepseek-v4-flash' : null
+      : model.startsWith('deepseekv4flash') ? 'deepseek-v4-flash'
+      : model === 'deepseekflash' ? 'deepseek-flash' : null
     if (kind) update(prices.models, id, kind)
   }
   update(prices, 'default', 'default')
@@ -573,8 +758,13 @@ export function normalizePrice(value) {
     entry.longContext = { aboveInputTokens: long.aboveInputTokens, ...completeTier(long) }
   }
   if (value.legacy === true) entry.legacy = true
-  if (value.billingMode === 'flat' || value.billingMode === 'deepseek-peak' || value.billingMode === 'batch') entry.billingMode = value.billingMode
+  if (value.billingMode === 'flat' || value.billingMode === 'deepseek-peak' || value.billingMode === 'utc-peak' || value.billingMode === 'batch') entry.billingMode = value.billingMode
   for (const key of ['sourceUrl', 'checkedAt', 'notes']) if (typeof value[key] === 'string') entry[key] = value[key]
+  if (value.cny !== undefined) {
+    if (!value.cny || typeof value.cny !== 'object' || Array.isArray(value.cny)
+      || !['cacheHit', 'cacheMiss', 'output'].every(key => validRate(value.cny[key]))) return null
+    entry.cny = completeTier(value.cny)
+  }
   const offPeak = completeTier(value.offPeak)
   if (offPeak !== undefined) entry.offPeak = offPeak
   const peak = completeTier(value.peak)
@@ -601,7 +791,8 @@ export function normalizePrice(value) {
     }
     entry.rateHistory.sort((a, b) => Date.parse(a.before) - Date.parse(b.before))
   }
-  return entry
+  Object.assign(entry, priceMultiplierSettings(value))
+  return validPriceMultipliers(entry) ? entry : null
 }
 
 /** 全部价格为 0 的记录视为空记录。 */
@@ -627,109 +818,72 @@ export function priceEntryFor(modelId, table) {
   return table?.default ?? { cacheHit: 0, cacheMiss: 0, output: 0 }
 }
 
-// ── 模型名自动匹配(精确 → 手动覆盖 → 去后缀/前缀/家族相似) ───────────
+// ── 模型名自动匹配(精确 → 归一化 → 安全后缀) ───────────
 
 /**
- * 模型名归一化:小写,去掉括号括起的附注(如 (go)),再只保留字母与数字。
+ * 模型名归一化:NFKC 全角/兼容字符归一化后转小写,仅去掉已知渠道附注 (go)/(zen),再只保留 Unicode 字母与数字。
  * 大小写、空格、横杠、下划线、点号等差异全部忽略:'GPT-5.6 Luna (Go)' → 'gpt56luna'。
  */
+function modelNameText(id) {
+  return String(id ?? '').normalize('NFKC').toLowerCase().replace(/[(（]\s*(?:go|zen)\s*[)）]/g, ' ').trim()
+}
 export function canonModelId(id) {
-  return String(id ?? '').toLowerCase()
-    .replace(/\([^)]*\)/g, ' ')
-    .replace(/（[^）]*）/g, ' ')
-    .replace(/[^a-z0-9]+/g, '')
+  return modelNameText(id).replace(/[^\p{L}\p{N}]+/gu, '')
 }
 
 function stripIdDecor(id) {
-  let out = String(id).toLowerCase()
-  // 去掉日期后缀(-2026-01-01 / -20260101 / @2026-01-01)与带 v 的版本号后缀(-v2 / -v1.5)。
-  // 注意:不剥裸数字后缀——'glm-5.3' 的 '-5.3' 是模型名本体而非版本后缀,
-  // 剥掉会让 glm-5.3/glm-5.2 都退化成 'glm' 而互配,把订阅制模型记到同家族付费价上(issue #18)。
-  out = out.replace(/[-@]\d{4}-?\d{2}-?\d{2}$/, '')
-  out = out.replace(/[-@]v\d+(\.\d+)*$/, '')
-  return out
+  // Strip request decorations one at a time; candidate snapshots keep their identity.
+  return modelNameText(id).replace(/[-_./:@](?:\d{4}-?\d{2}-?\d{2}|v\d+(?:\.\d+)*|\d+k|latest)$/, '')
 }
 
-const tokensOf = id => stripIdDecor(id).split(/[-_./:]+/).filter(Boolean)
-
-/**
- * 把请求模型 id 匹配到候选价格表 id。
- * 顺序:精确 → 归一化等价(忽略大小写/空格/横杠/点号/括号附注) → 宽泛包含
- * (请求名归一化后包含候选名即算命中,取最长候选) → 去日期/版本后缀精确
- * → 候选前缀(取最长) → 家族 token 相似(≥2 个前缀 token 且最长者胜)。
- * @param modelId - 请求模型 id。
- * @param candidates - 候选 id 数组。
- * @returns 命中的候选 id,或 null。
- */
-export function matchModelId(modelId, candidates) {
+/** Exact IDs precede unique punctuation aliases and request-only safe decorations. */
+export function matchModelId(modelId, candidates, exactId = modelId) {
   if (typeof modelId !== 'string' || modelId.length === 0) return null
   const list = Array.isArray(candidates) ? candidates.filter(c => typeof c === 'string' && c.length > 0) : []
-  if (list.length === 0) return null
-  const exact = list.find(c => c === modelId)
+  const exact = list.find(c => c === exactId)
   if (exact !== undefined) return exact
-  const canon = canonModelId(modelId)
-  if (canon.length === 0) return null
-  // 归一化后等价:'GPT-5.6 Luna' ≡ 'gpt-5.6-luna'。
-  const byCanon = list.find(c => canonModelId(c) === canon)
-  if (byCanon !== undefined) return byCanon
-  // 宽泛包含:'gpt5.6 luna(go)' 归一化后包含 'gpt56luna' 即命中;取最长候选,过短候选(≤3)防误配。
-  // 数字分叉守卫(issue #18 同源):候选是请求 canon 的真前缀且剩余段为 1-2 位
-  // 纯数字(glm-5 vs glm-5.3 → 'glm53' 含 'glm5' 余 '3')时视为版本分叉拒绝;
-  // '-20260821' 等日期快照(≥3 位)与 '-128k' 容量后缀不受影响。
-  let containHit = null
-  let containLen = 0
-  for (const c of list) {
-    const cc = canonModelId(c)
-    if (cc.length < 4 || cc === canon) continue
-    if (canon.includes(cc) && cc.length > containLen) {
-      const idx = canon.indexOf(cc)
-      if (/^\d{1,2}$/.test(canon.slice(idx + cc.length))) continue
-      containHit = c; containLen = cc.length
-    }
+  let target = modelId.normalize('NFKC').trim()
+  if (/[:(（]\s*(?:free|online)\b/i.test(target)) return null
+  for (;;) {
+    const canon = canonModelId(target)
+    if (canon.length === 0) return null
+    const hits = list.filter(c => canonModelId(c) === canon)
+    if (hits.length > 0) return hits.length === 1 ? hits[0] : null
+    const stripped = stripIdDecor(target)
+    if (stripped === target.toLowerCase()) return null
+    target = stripped
   }
-  if (containHit !== null) return containHit
-  const stripped = stripIdDecor(modelId)
-  const byStripped = list.find(c => stripIdDecor(c) === stripped)
-  if (byStripped !== undefined) return byStripped
-  // 前缀匹配:modelId(去饰后)以候选(去饰后)开头且紧接分隔符,取最长候选。
-  // 分隔符后的整段若为 1-2 位纯数字(gpt-5.9 的 '.9'、kimi-k2.6 的 '.6')同样
-  // 视为版本分叉拒绝;'-128k'/''-v3.1'/日期后缀等不受影响。
-  let prefixHit = null
-  for (const c of list) {
-    const cs = stripIdDecor(c)
-    if (cs.length === 0 || cs === stripped) continue
-    const rest = stripped.slice(cs.length)
-    if (stripped.startsWith(cs) && /^[\-_./:]/.test(rest)) {
-      if (/^\d{1,2}$/.test(rest.replace(/^[\-_./:]+/, ''))) continue
-      if (prefixHit === null || stripIdDecor(prefixHit).length < cs.length) prefixHit = c
-    }
+}
+
+const SCOPED_PRICE_PROVIDERS = new Set(['openrouter', 'opencode-zen', 'opencode-go', 'opencode-go-plus', 'zen', 'opencode', ...OPENDESIGN_PROVIDER_IDS])
+const MODEL_VENDOR_PREFIXES = {
+  openai: /^(?:gpt|o\d|codex)/i, anthropic: /^claude/i, google: /^gemini/i, stepfun: /^step-/i,
+  deepseek: /^deepseek/i, moonshot: /^kimi/i, 'z-ai': /^glm/i, xai: /^grok/i,
+  alibaba: /^qwen/i, minimax: /^minimax/i, tencent: /^(?:hunyuan|hy\d)/i,
+  xiaomi: /^mimo/i, upstage: /^solar/i, nvidia: /^nemotron/i, mistral: /^mistral/i,
+  meta: /^(?:muse|llama)/i, meituan: /^longcat/i,
+}
+function priceBillingMode(entry) {
+  return ['deepseek-peak', 'utc-peak'].includes(entry?.billingMode) ? entry.billingMode : 'flat'
+}
+// Full IDs win. Auto aliases may remove a known upstream namespace, never a routing variant.
+// Gemini API model resource names use models/{model}: https://ai.google.dev/api/models
+function priceModelHit(modelId, models, provider, mode, prices) {
+  if (typeof modelId !== 'string') return null
+  if (Object.hasOwn(models, modelId)) return modelId
+  if (mode !== 'auto') return null
+  let target = modelId.normalize('NFKC').trim().replace(/^models\/(?=gemini)/i, 'google/')
+  const sep = target.search(/[/:]/)
+  if (sep > 0) {
+    const vendor = target.slice(0, sep).trim().toLowerCase(), bare = target.slice(sep + 1).trim()
+    if (Object.hasOwn(MODEL_VENDOR_PREFIXES, vendor)
+      && (vendor === provider || (provider === 'opencode-zen' || provider === 'opencode-go')
+        && (MODEL_VENDOR_PREFIXES[vendor].test(bare)
+          || matchModelId(bare, Object.keys(vendor === 'deepseek' ? prices?.models ?? {} : prices?.providers?.[vendor]?.models ?? {})) !== null))) target = bare
+    else if (Object.hasOwn(MODEL_VENDOR_PREFIXES, vendor)) return null
   }
-  if (prefixHit !== null) return prefixHit
-  // 家族 token 相似:前缀公共 token ≥2,取公共最长者;同长取候选最短(更泛化的家族)。
-  const mt = tokensOf(modelId)
-  if (mt.length < 2) return null
-  let best = null
-  let bestLen = 0
-  for (const c of list) {
-    const ct = tokensOf(c)
-    let n = 0
-    while (n < mt.length && n < ct.length && mt[n] === ct[n]) n += 1
-    // 防跨版本误配(issue #18):分歧位置两侧都有数字/版本号 token(如 glm-5.3 vs glm-5.2)
-    // 视为不同模型拒绝匹配——订阅制/新版本模型不应落到同家族其它版本的付费单价。
-    if (n < mt.length && n < ct.length && /^\d+$/.test(mt[n]) && /^\d+$/.test(ct[n])) continue
-    // 候选 token 耗尽而请求多出的部分全是 1-2 位纯数字 token(glm-5 vs glm-5.3)
-    // 同为版本分叉,拒绝;多出日期(≥3 位)或带字母的容量/变体 token 时放行。
-    if (n >= 2 && n === ct.length && n < mt.length && mt.slice(n).every(t => /^\d{1,2}$/.test(t))) continue
-    // 分歧位一侧为 1-2 位版本号、另一侧为变体名(gpt-5.9 的 '9' vs gpt-5-nano
-    // 的 'nano'):containment/prefix 守卫生效后不再掉进变体互配,一并拒绝。
-    if (n >= 2 && n < mt.length && n < ct.length
-      && ((/^\d{1,2}$/.test(mt[n]) && /^[a-z]/.test(ct[n])) || (/^\d{1,2}$/.test(ct[n]) && /^[a-z]/.test(mt[n])))) continue
-    if (n >= 2 && (n > bestLen || (n === bestLen && best !== null && c.length < best.length))) {
-      best = c
-      bestLen = n
-    }
-  }
-  return best
+  // Formatting a request must not create a literal hit that bypasses alias collisions.
+  return matchModelId(target, Object.keys(models), modelId)
 }
 
 /**
@@ -751,6 +905,10 @@ function providerPriceEntryForNormalized(normalized, modelId, prices, options) {
   let targetProvider = normalized
   const overrideKey = (normalized === '' ? 'deepseek' : normalized) + ':' + modelId
   const override = overrides[overrideKey]
+  if (override === '__custom__') {
+    const entry = normalizeCustomPrice(prices?.custom?.[overrideKey])
+    return { entry, billingMode: 'flat', priced: entry !== null, currency: entry?.currency ?? 'USD' }
+  }
   // 「本地模型(零消耗)」哨兵(v1.6.11,issue #76 后续):覆盖目标 __local__ 表示
   // 把该 provider:model 显式标记为本地来源——token 照记、费用恒 0;设置页
   // 「已命中模型」与「未命中模型」列表的下拉框均提供该选项。
@@ -769,26 +927,39 @@ function providerPriceEntryForNormalized(normalized, modelId, prices, options) {
       const raw = prices?.default ?? { cacheHit: 0, cacheMiss: 0, output: 0 }
       const entry = normalizePrice(raw)
       if (entry === null) return { entry: null, billingMode: 'flat', priced: false }
-      return { entry, billingMode: 'deepseek-peak', priced: true }
+      return { entry, billingMode: 'deepseek-peak', priced: entry.unpriced !== true }
     }
+  }
+  // 保留历史宿主 Zen/Go 别名；用户在原渠道手写的条目优先。
+  if (['zen', 'opencode', 'opencode-go-plus'].includes(targetProvider)) {
+    const own = priceModelHit(targetModel, prices?.providers?.[targetProvider]?.models ?? {}, 'opencode-go', mode, prices)
+    if (own === null) targetProvider = 'opencode-go'
+    else targetModel = own
   }
   // 本地推理来源零价守卫(issue #76 附带):置于覆盖解析之后——显式 priceOverrides
   // 把本地模型改指任意(云端)目标时自然放行,未覆盖时一律未定价,自动匹配
   // (含下方 DeepSeek 主表与跨厂商兜底的模糊命中)不再误套云端价。
+  if (OPENDESIGN_PROVIDER_IDS.includes(targetProvider) && targetProvider !== 'opendesign'
+    && priceModelHit(targetModel, prices?.providers?.[targetProvider]?.models ?? {}, targetProvider, mode, prices) === null) targetProvider = 'opendesign'
   if (isLocalOriginProviderOrModel(targetProvider, targetModel)) {
     return { entry: null, billingMode: 'flat', priced: false }
+  }
+  // OpenRouter 的 :free / :online 等变体有独立价格；完整 id 精确查价，避免
+  // 新目录加入免费项后，未收录的付费模型或其他变体通过模糊匹配被记作免费。
+  if (targetProvider === 'openrouter') {
+    const models = prices?.providers?.openrouter?.models ?? {}
+    const entry = Object.hasOwn(models, targetModel) ? normalizePrice(models[targetModel]) : null
+    return { entry, billingMode: 'flat', priced: entry !== null && entry.unpriced !== true }
   }
   if (targetProvider === '' || targetProvider === 'deepseek' || targetProvider.includes('deepseek')) {
     const models = prices?.models ?? {}
     // 仅认自有属性(防原型链键);命中后统一 normalizePrice 补齐两档简写等写法,
     // 避免 {input,output} 直返导致 costOf 取到 undefined → NaN。
-    const hit = Object.hasOwn(models, targetModel)
-      ? targetModel
-      : (mode === 'auto' ? matchModelId(targetModel, Object.keys(models)) : null)
+    const hit = priceModelHit(targetModel, models, 'deepseek', mode, prices)
     if (hit !== null && hit !== undefined) {
       const raw = models[hit]
       const entry = normalizePrice(raw)
-      if (entry === null) return { entry: null, billingMode: 'flat', priced: false }
+      if (entry === null || entry.unpriced === true) return { entry: null, billingMode: 'flat', priced: false }
       return { entry, billingMode: 'deepseek-peak', priced: true }
     }
     // 回退: provider 缺失/DeepSeek 但模型实际属于 Go 等其它目录时，避免
@@ -798,22 +969,25 @@ function providerPriceEntryForNormalized(normalized, modelId, prices, options) {
     if (mode === 'auto') {
       let bestEntry = null
       let bestLen = -1
+      let ambiguous = false
       let bestMode = 'flat'
       for (const [prov, table] of Object.entries(prices?.providers ?? {})) {
+        if (SCOPED_PRICE_PROVIDERS.has(prov)) continue // 渠道价不作为其他渠道的兜底价。
         const modelsCat = table?.models ?? {}
-        const h = matchModelId(targetModel, Object.keys(modelsCat))
+        const h = priceModelHit(targetModel, modelsCat, prov, mode, prices)
         if (h === null) continue
         const entry = normalizePrice(modelsCat[h])
-        if (entry === null || entry.unpriced === true) continue
-        const isExact = h === targetModel || canonModelId(h) === canonModelId(targetModel)
-        const score = (isExact ? 1000 : 0) + canonModelId(h).length
+        if (entry === null) continue
+        const score = +(h === targetModel || canonModelId(h) === canonModelId(targetModel))
         if (score > bestLen) {
           bestEntry = entry
           bestLen = score
-          bestMode = modelsCat[h]?.billingMode === 'deepseek-peak' ? 'deepseek-peak' : 'flat'
-        }
+          ambiguous = false
+          bestMode = priceBillingMode(modelsCat[h])
+        } else if (score === bestLen) ambiguous = true
       }
-      if (bestEntry !== null) return { entry: bestEntry, billingMode: bestMode, priced: true }
+      if (ambiguous) return { entry: null, billingMode: 'flat', priced: false }
+      if (bestEntry !== null) return { entry: bestEntry, billingMode: bestMode, priced: bestEntry.unpriced !== true }
     }
     const raw = priceEntryFor(targetModel, prices)
     const entry = normalizePrice(raw)
@@ -822,43 +996,38 @@ function providerPriceEntryForNormalized(normalized, modelId, prices, options) {
   }
   const providerTable = prices?.providers?.[targetProvider]
   const catalog = providerTable?.models ?? {}
-  let hit = Object.hasOwn(catalog, targetModel) ? targetModel : null
-  if (hit === null && mode === 'auto') hit = matchModelId(targetModel, Object.keys(catalog))
+  const hit = priceModelHit(targetModel, catalog, targetProvider, mode, prices)
+  if (hit === null && SCOPED_PRICE_PROVIDERS.has(targetProvider)) return { entry: null, billingMode: 'flat', priced: false }
+  if (hit === null && Object.hasOwn(MODEL_VENDOR_PREFIXES, targetProvider)) return { entry: null, billingMode: 'flat', priced: false }
   if (hit === null && mode === 'auto') {
     // 跨厂商兑底:请求携带的 provider 未在价格表登记(opencode / zen 等路由入口)时,
-    // 按模型名全库查找——先查 DeepSeek 主表(保留峰谷两档),再取其余厂商中归一化最长命中。
-    const dsModels = prices?.models ?? {}
-    const dsHit = matchModelId(targetModel, Object.keys(dsModels))
-    if (dsHit !== null) {
-      const raw = dsModels[dsHit]
-      const entry = normalizePrice(raw)
-      if (entry === null) return { entry: null, billingMode: 'flat', priced: false }
-      return { entry, billingMode: 'deepseek-peak', priced: true }
-    }
+    // 按模型名全库查找——先查 DeepSeek 主表(保留峰谷两档),按精确优先、同等级多渠道命中拒绝猜价。
     let bestEntry = null
     let bestLen = -1
+    let ambiguous = false
     let bestMode = 'flat'
-    for (const [prov, table] of Object.entries(prices?.providers ?? {})) {
-      if (prov === targetProvider) continue
+    for (const [prov, table] of [['deepseek', { models: prices?.models ?? {} }], ...Object.entries(prices?.providers ?? {})]) {
+      if (prov === targetProvider || SCOPED_PRICE_PROVIDERS.has(prov)) continue
       const models = table?.models ?? {}
-      const h = matchModelId(targetModel, Object.keys(models))
+      const h = priceModelHit(targetModel, models, prov, mode, prices)
       if (h === null) continue
       const entry = normalizePrice(models[h])
-      if (entry === null || entry.unpriced === true) continue
-      const isExact = h === targetModel || canonModelId(h) === canonModelId(targetModel)
-      const score = (isExact ? 1000 : 0) + canonModelId(h).length
+      if (entry === null) continue
+      const score = +(h === targetModel || canonModelId(h) === canonModelId(targetModel))
       if (score > bestLen) {
         bestEntry = entry
         bestLen = score
-        bestMode = models[h]?.billingMode === 'deepseek-peak' ? 'deepseek-peak' : 'flat'
-      }
+        ambiguous = false
+        bestMode = prov === 'deepseek' ? 'deepseek-peak' : priceBillingMode(models[h])
+      } else if (score === bestLen) ambiguous = true
     }
-    if (bestEntry !== null) return { entry: bestEntry, billingMode: bestMode, priced: true }
+    if (ambiguous) return { entry: null, billingMode: 'flat', priced: false }
+    if (bestEntry !== null) return { entry: bestEntry, billingMode: bestMode, priced: bestEntry.unpriced !== true }
   }
   if (hit === null) return { entry: null, billingMode: 'flat', priced: false }
   const entry = normalizePrice(catalog[hit])
   if (entry === null || entry.unpriced === true) return { entry: null, billingMode: 'flat', priced: false }
-  return { entry, billingMode: catalog[hit].billingMode === 'deepseek-peak' ? 'deepseek-peak' : 'flat', priced: true }
+  return { entry, billingMode: priceBillingMode(catalog[hit]), priced: true }
 }
 
 /**
@@ -875,7 +1044,7 @@ function deepseekExplicitEntry(modelName, prices, mode) {
   if (hit === null || hit === undefined) return null
   const raw = models[hit]
   const entry = normalizePrice(raw)
-  if (entry === null) return null
+  if (entry === null || entry.unpriced === true) return null
   return { entry, billingMode: 'deepseek-peak', priced: true }
 }
 
@@ -920,7 +1089,7 @@ export function wrapperUpstreamProvider(provider) {
  * 一致(verify.mjs 漂移守卫锁定双侧同输入同结果)。
  */
 const LOCAL_PROVIDER_IDS = new Set([
-  'lmstudio', 'ollama', 'jan', 'gpt4all', 'koboldcpp', 'llamacpp', 'llama-cpp', 'localai',
+  'local', 'lmstudio', 'ollama', 'jan', 'gpt4all', 'koboldcpp', 'llamacpp', 'llama-cpp', 'localai',
   'vllm', 'sglang', 'tabbyapi', 'lmdeploy', 'oobabooga', 'text-generation-webui', 'llama-server',
 ])
 const LOCAL_MODEL_PREFIXES = [
@@ -931,7 +1100,7 @@ const LOCAL_MODEL_PREFIXES = [
 ]
 export function isLocalOriginProviderOrModel(provider, modelId) {
   if (typeof provider === 'string' && LOCAL_PROVIDER_IDS.has(provider)) return true
-  const model = typeof modelId === 'string' ? modelId.toLowerCase() : ''
+  const model = typeof modelId === 'string' ? modelNameText(modelId) : ''
   return LOCAL_MODEL_PREFIXES.some(prefix => model.startsWith(prefix))
 }
 
@@ -946,30 +1115,49 @@ export function providerPriceEntryFor(provider, modelId, prices, options) {
   const rawProvider = typeof provider === 'string' ? provider.trim().toLowerCase() : ''
   const normalized = rawProvider.startsWith('llm-') ? rawProvider.slice(4) : rawProvider
   const primary = providerPriceEntryForNormalized(normalized, modelId, prices, options)
-  if (primary.priced) return primary
+  if (primary.currency) return primary
+  if (primary.priced) return selectPriceCurrency(primary, prices)
   // issue #56:v1.5.42 及之前设置页下拉框把 DeepSeek 目标模型存成裸名(缺
   // 'deepseek:' 前缀),被按「同渠道换名」解析——映射键的渠道与 DeepSeek 不同时
   // 查无此价,金额归零。此处对「裸值覆盖 + 非 DeepSeek 渠道解析失败」回退按
   // DeepSeek 渠道再查一次,存量错误配置无需手工修正即自愈。
-  if (normalized === '' || normalized === 'deepseek' || normalized.includes('deepseek')) return primary
+  if (normalized === '' || normalized === 'deepseek' || normalized.includes('deepseek')) return selectPriceCurrency(primary, prices)
   const overrides = options?.overrides !== null && typeof options?.overrides === 'object' ? options.overrides : {}
   const override = overrides[normalized + ':' + modelId]
-  if (typeof override !== 'string' || override.length === 0 || override.includes(':')) return primary
+  if (typeof override !== 'string' || override.length === 0 || override === '__local__' || override.includes(':')) return selectPriceCurrency(primary, prices)
   const mode = options?.mode === 'exact' ? 'exact' : 'auto'
-  return deepseekExplicitEntry(override, prices, mode) ?? primary
+  return selectPriceCurrency(deepseekExplicitEntry(override, prices, mode) ?? primary, prices)
+}
+
+function selectPriceCurrency(result, prices) {
+  if (result.currency) return result
+  if (!result.priced) return { ...result, currency: 'USD' }
+  if (prices?.currency === 'CNY' && result.entry?.cny) {
+    return { ...result, entry: cnyPrice(result.entry), currency: 'CNY' }
+  }
+  return { ...result, currency: result.billingMode === 'deepseek-peak' && prices?.currency === 'CNY' ? 'CNY' : 'USD' }
+}
+
+/** A channel/model quote has its own currency and never enters catalog matching. */
+export function normalizeCustomPrice(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !['USD', 'CNY'].includes(raw.currency)) return null
+  if (!['cacheMiss', 'cacheHit', 'output'].every(key => typeof raw[key] === 'number' && Number.isFinite(raw[key]) && raw[key] >= 0)) return null
+  if (['cacheWrite', 'reasoning'].some(key => raw[key] !== undefined && (typeof raw[key] !== 'number' || !Number.isFinite(raw[key]) || raw[key] < 0))) return null
+  const entry = { ...completeTier(raw), ...priceMultiplierSettings(raw), currency: raw.currency, billingMode: 'flat' }
+  return validPriceMultipliers(entry) ? entry : null
 }
 
 /**
- * 某一时刻是否处于峰时段。周末全谷价新规(WEEKEND_OFFPEAK_EFFECTIVE_AT 起,
- * 北京时间周六/周日)优先于峰窗口:周末恒为谷,不受窗口影响。
+ * 某一时刻是否处于峰时段。北京时间周末与配置的中国公众假期全天谷价,
+ * 优先于峰窗口；调休上班的周末仍按周末处理。
  * @param atMs - 时刻(epoch ms)。
  * @param effectiveAtMs - 峰谷计价生效时刻(epoch ms)。
  * @param windows - 峰时段窗口数组({start,end} UTC 小时,半开区间)。
  * @returns 峰时段返回 true;生效前或窗口外返回 false。
  */
-export function isPeakHour(atMs, effectiveAtMs, windows) {
+export function isPeakHour(atMs, effectiveAtMs, windows, holidays = DEFAULT_PEAK_HOLIDAYS) {
   if (!Array.isArray(windows) || windows.length === 0) return false
-  if (weekendZoneAt(atMs) !== null) return false
+  if (offPeakZoneAt(atMs, holidays) !== null) return false
   if (Number.isFinite(effectiveAtMs) && atMs < effectiveAtMs) return false
   const hour = new Date(atMs).getUTCHours()
   return windows.some(w => {
@@ -985,16 +1173,14 @@ export function isPeakHour(atMs, effectiveAtMs, windows) {
 /**
  * 某一时刻所处的峰谷相位与相邻相位切换点(供倒计时/进度条展示)。
  * 窗口为半开区间 [start, end)(UTC 小时),兼容跨午夜窗口(end <= start)。
- * 周末全谷价新规:处于周末区间时相位为谷(weekend 标记,供 UI 显示
- * 「周末时段——全谷价」),下一个价格切换点为下一工作日的首个峰窗口起点;
- * 工作日侧扫描 ±4 天并剔除落在周末区间内的切换点(周末内无价格变化,
- * 周五晚 → 周一首个峰起点之间价格恒为谷,不构成切换)。
+ * 周末或假日区间相位为谷(weekend/holiday 标记供 UI 显示),下一个价格切换点
+ * 跨过连续全天谷价日期。扫描范围随假日表长度扩大。
  * @param atMs - 时刻(epoch ms)。
  * @param windows - 峰时段窗口数组。
  * @returns { inPeak, weekend, prevAtMs, nextAtMs, nextIntoPeak },或 null(无有效
  *   窗口/时刻)。weekend 为 true 表示当前处于周末全谷价区间。
  */
-export function peakPhaseAt(atMs, windows) {
+export function peakPhaseAt(atMs, windows, holidays = DEFAULT_PEAK_HOLIDAYS) {
   if (!Array.isArray(windows) || windows.length === 0 || !Number.isFinite(atMs)) return null
   const hourAt = (dayOffset, hour) => {
     const date = new Date(atMs)
@@ -1002,34 +1188,39 @@ export function peakPhaseAt(atMs, windows) {
     date.setUTCHours(hour, 0, 0, 0)
     return date.getTime()
   }
-  // 收集前后 4 天的全部切换点(足以跨越最长周末间隔),剔除落在周末区间内的点。
-  const points = []
-  for (let day = -4; day <= 4; day += 1) {
+  // 候选窗口端点与北京日期边界；只有峰谷状态真的改变才算切换。
+  const candidates = new Set()
+  const span = Math.max(12, Math.min(380, (Array.isArray(holidays) ? holidays.length : 0) + 7))
+  for (let day = -span; day <= span; day += 1) {
+    candidates.add(hourAt(day, 16)) // 北京时间次日 00:00
     for (const w of windows) {
       const start = Number(w?.start)
       const end = Number(w?.end)
       if (!Number.isFinite(start) || !Number.isFinite(end)) continue
-      const pStart = { at: hourAt(day, start), intoPeak: true }
-      // 跨午夜窗口的结束点落在次日。
-      const pEnd = { at: hourAt(end <= start ? day + 1 : day, end), intoPeak: false }
-      if (weekendZoneAt(pStart.at) === null) points.push(pStart)
-      if (weekendZoneAt(pEnd.at) === null) points.push(pEnd)
+      candidates.add(hourAt(day, start))
+      candidates.add(hourAt(end <= start ? day + 1 : day, end))
     }
   }
+  const points = [...candidates].sort((a, b) => a - b).flatMap(at => {
+    const before = isPeakHour(at - 1, undefined, windows, holidays)
+    const after = isPeakHour(at, undefined, windows, holidays)
+    return before === after ? [] : [{ at, intoPeak: after }]
+  })
   let prev = null
   let next = null
   for (const p of points) {
     if (p.at <= atMs && (prev === null || p.at > prev.at)) prev = p
     if (p.at > atMs && (next === null || p.at < next.at)) next = p
   }
-  const wk = weekendZoneAt(atMs)
+  const holiday = holidayZoneAt(atMs, holidays)
+  const wk = holiday ?? weekendZoneAt(atMs)
   if (wk !== null) {
     // 周末全谷价:当前谷,下一切换 = 下一个工作日的首个峰窗口起点。
     if (next === null) return null
-    return { inPeak: false, weekend: true, prevAtMs: wk.start, nextAtMs: next.at, nextIntoPeak: next.intoPeak }
+    return { inPeak: false, weekend: holiday === null, ...(holiday ? { holiday: true } : {}), prevAtMs: wk.start, nextAtMs: next.at, nextIntoPeak: next.intoPeak }
   }
   if (prev === null || next === null) return null
-  const inPeak = isPeakHour(atMs, undefined, windows)
+  const inPeak = isPeakHour(atMs, undefined, windows, holidays)
   return { inPeak, weekend: false, prevAtMs: prev.at, nextAtMs: next.at, nextIntoPeak: next.intoPeak }
 }
 
@@ -1043,27 +1234,31 @@ export function peakPhaseAt(atMs, windows) {
  */
 export function tierFor(entry, atMs, peak) {
   const base = priceAt(entry, atMs) ?? { cacheHit: 0, cacheMiss: 0, output: 0 }
-  const asTier = price => ({ cacheHit: price.cacheHit, cacheMiss: price.cacheMiss, output: price.output,
-    ...(price.reasoning === undefined ? {} : { reasoning: price.reasoning }),
-    ...(price.cacheWrite === undefined ? {} : { cacheWrite: price.cacheWrite }),
-    ...(price.longContext === undefined ? {} : { longContext: price.longContext }) })
+  const asTier = (price, path = 'base') => multipliedTier(price, base, path)
+  // Go 的公开参考价格按 UTC 工作日计峰谷，不能套直接 API 的北京假期表。
+  if (base.billingMode === 'utc-peak') {
+    if (peak?.enabled !== true || !Number.isFinite(atMs)) return asTier(base)
+    const date = new Date(atMs), day = date.getUTCDay(), hour = date.getUTCHours()
+    const high = day > 0 && day < 6 && ((hour >= 1 && hour < 4) || (hour >= 6 && hour < 10))
+    return asTier((high ? base.peak : base.offPeak) ?? base, (high ? base.peak : base.offPeak) ? (high ? 'peak' : 'offPeak') : 'base')
+  }
   // 峰谷时代之前(2026-08-16 16:00 UTC 前):按当时的基础价计费(历史正确性)。
   if (Number.isFinite(atMs) && atMs < Date.parse(LEGACY_BASE_BOUNDARY)) {
     const lb = base.legacyBase
-    return lb === undefined ? asTier(base) : asTier(lb)
+    return lb === undefined ? asTier(base) : asTier(lb, 'legacyBase')
   }
   if (peak?.enabled !== true) return asTier(base)
   // 非有限(如 Date.parse('') 的 NaN)一律视同「未知生效时刻」,与 isPeakHour 的
   // Number.isFinite 门控同口径:峰侧/谷侧对 NaN 的判定不再不对称(NaN 介于数字
   // 之间比较恒 false,曾致谷时段落到 base 档而峰时段按已生效取 peak 档)。
   const effectiveAtMs = typeof peak.effectiveAtMs === 'number' && Number.isFinite(peak.effectiveAtMs) ? peak.effectiveAtMs : undefined
-  if (isPeakHour(atMs, effectiveAtMs, peak.windows)) {
+  if (isPeakHour(atMs, effectiveAtMs, peak.windows, peak.holidays)) {
     const p = base.peak
-    return p === undefined ? asTier(base) : asTier(p)
+    return p === undefined ? asTier(base) : asTier(p, 'peak')
   }
   if (effectiveAtMs !== undefined && atMs >= effectiveAtMs) {
     const off = base.offPeak
-    return off === undefined ? asTier(base) : asTier(off)
+    return off === undefined ? asTier(base) : asTier(off, 'offPeak')
   }
   return asTier(base)
 }
@@ -1289,6 +1484,22 @@ export function parsePricingHtml(html) {
   }
   // 生效时间:页面已不再给出(两档方案即时生效)→ null。
   const effectiveAt = null
+  // 官网明确旧 Flash 名称仍可调用并按 Flash 价计费，同步时一起更新这些名称。
+  if (models['deepseek-flash']) {
+    for (const alias of ['deepseek-v4-flash', 'deepseek-v4-flash-vision-exp', 'deepseek-v4.1-flash']) {
+      if (models[alias]) continue
+      models[alias] = structuredClone(models['deepseek-flash'])
+      const legacy = (currency === 'CNY' ? LEGACY_BASE_PRICES_CNY : LEGACY_BASE_PRICES)[alias]
+      if (legacy) models[alias].legacyBase = { ...legacy }
+    }
+  }
+  // 仅给与已核对报价完全一致的 Flash 条目附带历史，不改写官网解析出的当前价格。
+  const known = currency === 'CNY' ? DEFAULT_PRICE_TABLE_CNY : DEFAULT_PRICE_TABLE
+  for (const [id, entry] of Object.entries(models)) {
+    const template = known.models[id]
+    if (template?.rateHistory && ['cacheHit', 'cacheMiss', 'output'].every(key => entry[key] === template[key]
+      && entry.peak[key] === template.peak[key])) entry.rateHistory = structuredClone(template.rateHistory)
+  }
   // 默认回退沿用首个成功模型的完整档位；只复制谷价会让峰时费用少算一半。
   const fallback = structuredClone(Object.values(models)[0])
   // 峰时段窗口。
@@ -1315,7 +1526,6 @@ export function parsePricingHtml(html) {
     }
   }
   const parsed = { models, default: fallback, effectiveAt, peakWindows, currency }
-  // 官方文档/CDN 仍可能停留在旧表；已公布的调价规则不被一次同步回滚。
-  upgradeDeepSeekPriceTable(parsed)
+  // 官方页是同步的价格来源；内置升级规则不得覆盖刚解析的官方报价。
   return parsed
 }

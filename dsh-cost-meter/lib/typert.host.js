@@ -1,3 +1,4 @@
+import { multiplierPath } from './price-multiplier.js'
 /**
  * dsh-cost-meter 的 Host 面 Typert 清单(由 typert-loader 自动扫描注册)。
  * 手写清单,结构与 @deepseek-ai/dsh-typert-generator 产物一致:
@@ -7,6 +8,7 @@
 import { z } from 'zod'
 
 const num = z.number()
+const frozenMoney = Object.fromEntries(['costCny', 'apiCostCny', 'costEur', 'apiCostEur'].map(key => [key, num.optional()]))
 
 const sessionSchema = z.object({
   id: z.string(),
@@ -21,7 +23,8 @@ const sessionSchema = z.object({
   cost: num,
   // API 渠道金额(issue #64):真金白银部分;缺席 = 旧快照按 cost 全额 API。
   apiCost: num.optional(),
-  byProviderModel: z.record(z.string(), z.object({ input: num, output: num, cacheRead: num, cacheWrite: num, reasoning: num.optional(), calls: num, cost: num, apiCost: num.optional() })).optional(),
+  ...frozenMoney,
+  byProviderModel: z.record(z.string(), z.object({ input: num, output: num, cacheRead: num, cacheWrite: num, reasoning: num.optional(), calls: num, cost: num, apiCost: num.optional(), ...frozenMoney })).optional(),
 })
 
 const daySchema = z.object({
@@ -34,8 +37,17 @@ const daySchema = z.object({
   calls: num,
   cost: num,
   apiCost: num.optional(),
-  byProviderModel: z.record(z.string(), z.object({ input: num, output: num, cacheRead: num, cacheWrite: num, reasoning: num.optional(), calls: num, cost: num, apiCost: num.optional() })).optional(),
+  ...frozenMoney,
+  byProviderModel: z.record(z.string(), z.object({ input: num, output: num, cacheRead: num, cacheWrite: num, reasoning: num.optional(), calls: num, cost: num, apiCost: num.optional(), ...frozenMoney })).optional(),
   sessions: z.array(sessionSchema),
+})
+
+const externalSummarySchema = z.object({ today: daySchema, month: daySchema, total: daySchema, history: z.array(daySchema) })
+const externalUsageSchema = z.object({
+  fetchedAt: num,
+  stale: z.boolean(),
+  sources: z.array(externalSummarySchema.extend({ source: z.string() })),
+  combined: externalSummarySchema,
 })
 
 // 带所属日期的会话条目(issue #22 按会话排行:不分日期视角)。
@@ -50,6 +62,72 @@ export const sessionCostSchema = z.object({
   subagents: sessionSchema,
   subagentCount: num,
   found: z.boolean(),
+})
+const turnCostRowSchema = z.object({ provider: z.string(), model: z.string(), bucket: z.string(), tokens: num, requests: num.optional(), rate: num, cost: num, priced: z.boolean(), plan: z.boolean() })
+const meteringSchema = z.object({ source: z.literal('billion-context'), requestId: z.string(), attempt: num, complete: z.boolean(), status: z.string(), upstream: z.string() }).optional()
+export const turnCostSchema = z.object({
+  found: z.boolean(), cost: num, apiCost: num, ...frozenMoney,
+  inherited: z.boolean().optional(),
+  rows: z.array(turnCostRowSchema),
+  calls: z.array(z.object({ kind: z.string(), provider: z.string(), model: z.string(), atMs: num, cost: num, apiCost: num, plan: z.boolean(), priced: z.boolean(), longContext: z.boolean(), rows: z.array(turnCostRowSchema), metering: meteringSchema })),
+})
+
+export const statisticsQuerySchema = z.object({
+  displayCurrency: z.enum(['USD', 'CNY', 'EUR']).optional(),
+  from: z.string().max(10).optional(), to: z.string().max(10).optional(),
+  provider: z.string().max(512).optional(), model: z.string().max(512).optional(), sessionId: z.string().max(512).optional(),
+  basis: z.enum(['api', 'plan', 'total']).optional(), offset: z.number().int().min(0).max(1e7).optional(),
+  turnOffset: z.number().int().min(0).max(1e7).optional(), background: z.boolean().optional(), generation: z.string().max(96).optional(),
+})
+const statisticsBuckets = z.object(Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite', 'reasoning', 'calls', 'cost', 'apiCost'].map(key => [key, num])))
+export const billingStatisticsSchema = z.object({
+  from: z.string(), to: z.string(), retainedFrom: z.string(), retainedTo: z.string(), totals: statisticsBuckets,
+  days: z.array(statisticsBuckets.extend({ date: z.string() })),
+  models: z.array(statisticsBuckets.extend({ key: z.string(), provider: z.string(), model: z.string(), priced: z.boolean() })),
+  providers: z.array(z.string()), modelOptions: z.array(z.string()),
+  sessions: z.array(statisticsBuckets.extend({ id: z.string(), title: z.string() })),
+  sessionCount: num, offset: num, unassignedCost: num, unmodeledCost: num,
+})
+const sessionBillingCallSchema = turnCostSchema.shape.calls.element.extend({ sessionId: z.string().default(''), turn: num.nullable(), step: num.nullable(), logSeq: num.nullable().default(null) })
+export const sessionBillingSchema = turnCostSchema.extend({ refreshing: z.boolean().default(false), generatedAt: num.default(0), refreshFailed: z.boolean().default(false), totalCalls: num, offset: num, recorded: statisticsBuckets,
+  calls: z.array(sessionBillingCallSchema),
+  agents: z.array(statisticsBuckets.extend({ id: z.string(), title: z.string() })).default([]),
+  kinds: z.array(statisticsBuckets.extend({ kind: z.string(), unpriced: z.boolean() })),
+  turns: z.array(statisticsBuckets.extend({ sessionId: z.string().default(''), turn: num.nullable(), unpriced: z.boolean() })),
+  totalTurns: num, turnOffset: num,
+  callShares: z.array(z.object({ index: num, cost: num, apiCost: num, tokens: num, calls: num, other: z.boolean(), unpriced: z.boolean(), call: sessionBillingCallSchema.nullable().default(null) })).default([]),
+  stepShares: z.object(Object.fromEntries(['cost', 'calls'].map(key => [key, z.array(statisticsBuckets.extend({ sessionId: z.string().default(''), turn: num.nullable(), step: num.nullable(), other: z.boolean(), unpriced: z.boolean() }))]))),
+})
+export const turnInspectionQuerySchema = z.object({ sessionId: z.string().min(1).max(512), turn: z.number().int().min(0), offset: z.number().int().min(0).max(1e7).optional() })
+export const turnInspectionSchema = z.object({ found: z.boolean(), turn: num, input: z.string(), inputTruncated: z.boolean(), totalTools: num, offset: num,
+  tools: z.array(z.object({ seq: num, step: num.nullable(), name: z.string(), callId: z.string(), atMs: num, arguments: z.string(), result: z.string(), truncated: z.boolean(), status: z.enum(['pending', 'complete', 'error']) })) })
+
+export const contextCostsQuerySchema = z.object({ sessionId: z.string().min(1).max(512) })
+const trajectoryPartsSchema = z.array(z.object({ bucket: z.string(), cost: num, apiCost: num, tokens: num, unpriced: z.boolean() })).default([])
+const trajectoryGroupSchema = z.object({ key: z.string(), kind: z.string(), sessionId: z.string().default(''), title: z.string().default(''), tools: z.array(z.string()), steps: num, calls: num.default(0), cost: num, apiCost: num, unpriced: z.boolean(), parts: trajectoryPartsSchema })
+export const trajectoryQuerySchema = contextCostsQuerySchema.extend({ displayCurrency: z.enum(['USD', 'CNY', 'EUR']).optional(), basis: z.enum(['api', 'plan', 'total']).default('total'), offset: z.number().int().min(0).max(1e7).default(0),
+  operation: z.string().max(80).default(''), operationGroup: z.string().max(4096).default(''), stepKey: z.string().max(2048).default(''), detail: z.enum(['full', 'map']).default('full'), ownOnly: z.boolean().default(false),
+  background: z.boolean().default(false), generation: z.string().max(96).default(''), order: z.enum(['cost', 'time']).default('time'), group: z.string().max(1024).default(''), agent: z.string().max(512).default('') })
+export const trajectorySchema = z.object({ refreshing: z.boolean().default(false), generatedAt: num.default(0), refreshFailed: z.boolean().default(false), cost: num, apiCost: num, totalSteps: num, totalCalls: num.default(0), matchingSteps: num.default(0), order: z.enum(['cost', 'time']).default('time'), offset: num,
+  shares: z.array(z.object({ key: z.string(), sessionId: z.string(), turn: num.nullable(), step: num.nullable(), kind: z.string(), tools: z.array(z.string()), cost: num, apiCost: num, unpriced: z.boolean(), other: z.boolean(), count: num })),
+  tiles: z.array(z.object({ key: z.string(), groupKey: z.string(), sessionId: z.string(), turn: num.nullable(), step: num.nullable(), kind: z.string(), tools: z.array(z.string()), cost: num, apiCost: num, unpriced: z.boolean(), other: z.boolean(), count: num })).default([]),
+  groups: z.array(trajectoryGroupSchema), operations: z.array(trajectoryGroupSchema).default([]),
+  operationGroups: z.array(trajectoryGroupSchema.extend({ operationKey: z.string() })).default([]),
+  distribution: z.array(z.object({ key: z.string(), steps: num, calls: num, cost: num, apiCost: num, unpriced: z.boolean() })).default([]),
+  hierarchy: z.array(z.object({ id: z.string(), parentId: z.string(), title: z.string(), cost: num, apiCost: num, ownCost: num, ownApiCost: num, steps: num, calls: num, ownSteps: num, ownCalls: num, unpriced: z.boolean().default(false),
+    groups: z.array(trajectoryGroupSchema), operations: z.array(trajectoryGroupSchema).default([]) })).default([]),
+  steps: z.array(z.object({ key: z.string(), groupKey: z.string().default(''), typeKey: z.string().default(''), operationKey: z.string().default(''), operationGroupKey: z.string().default(''), sessionId: z.string(), turn: num.nullable(), step: num.nullable(), kind: z.string(), tools: z.array(z.string()), atMs: num, calls: num, cost: num, apiCost: num, unpriced: z.boolean(), rows: turnCostSchema.shape.rows, callRefs: sessionBillingSchema.shape.calls.default([]) })) })
+export const callInspectionQuerySchema = z.object({ sessionId: z.string().min(1).max(512), seq: z.number().int().min(0), atMs: z.number().finite().positive(), offset: z.number().int().min(0).max(1e7).optional() })
+export const callInspectionSchema = z.object({ found: z.boolean(), kind: z.string(), input: z.string(), injected: z.string(), skills: z.string(), precedingTools: z.string(), output: z.string(), reasoning: z.string(), truncated: z.boolean(),
+  tools: z.array(turnInspectionSchema.shape.tools.element.extend({ durationMs: num.nullable().default(null) })), totalTools: num, offset: num })
+const contextRateSchema = z.object(Object.fromEntries(['input', 'cacheRead', 'cacheWrite', 'output', 'reasoning'].map(key => [key, z.number().finite().nonnegative()])))
+export const contextCostsSchema = z.object({
+  status: z.enum(['ready', 'busy', 'unavailable', 'session-unavailable', 'meter-unavailable', 'route-unavailable']),
+  sessionId: z.string(), generatedAt: num, revision: num, provider: z.string(), model: z.string(), basis: z.enum(['api', 'plan']), priced: z.boolean(),
+  source: z.enum(['none', 'usage', 'estimate']), linked: z.boolean(), contextTokens: z.number().finite().nonnegative(),
+  components: z.array(z.object({ key: z.enum(['system', 'tools', 'user', 'inject', 'skill', 'assistant', 'tool', 'other']), tokens: z.number().finite().nonnegative() })),
+  rates: contextRateSchema.nullable(), longContext: contextRateSchema.extend({ aboveInputTokens: z.number().positive() }).nullable(),
+  lastCall: turnCostSchema.shape.calls.element.extend({ sessionId: z.string().default(''), turn: num.nullable().default(null), step: num.nullable().default(null) }).nullable(),
 })
 
 const longContextSchema = z.object({
@@ -75,42 +153,50 @@ const rateHistorySchema = priceTierSchema.extend({
   peak: priceTierSchema.optional(),
 })
 
+const multiplierShape = {
+  multiplier: z.number().finite().nonnegative().optional(),
+  separateMultipliers: z.boolean().optional(),
+  multipliers: z.record(z.string().regex(multiplierPath), z.number().finite().nonnegative()).optional(),
+}
 const providerPriceSchema = z.object({
+  ...multiplierShape,
+  cacheHit: num.optional(),
+  cacheMiss: num.optional(),
   input: num.optional(),
   cachedInput: num.optional(),
   cacheRead: num.optional(),
   cacheWrite: z.number().nonnegative().optional(),
+  cny: priceTierSchema.optional(),
   longContext: longContextSchema.optional(),
+  offPeak: priceTierSchema.optional(),
+  peak: priceTierSchema.optional(),
   cacheCreation5m: num.optional(),
   cacheCreation1h: num.optional(),
   output: num.optional(),
   reasoning: num.optional(),
   unpriced: z.boolean().optional(),
-  billingMode: z.enum(['flat', 'deepseek-peak', 'batch']).optional(),
+  billingMode: z.enum(['flat', 'deepseek-peak', 'utc-peak', 'batch']).optional(),
   sourceUrl: z.string().optional(),
   checkedAt: z.string().optional(),
   notes: z.string().optional(),
 })
 
-/** 拓展价格目录条目:兼容三桶价(DeepSeek,含峰谷子档)与两档简写/未核价(第三方)。unpriced 继承自 providerPriceSchema。 */
 const catalogEntrySchema = providerPriceSchema.extend({
-  cacheHit: num.optional(),
-  cacheMiss: num.optional(),
-  legacy: z.boolean().optional(),
-  offPeak: priceTierSchema.optional(),
-  peak: priceTierSchema.optional(),
-  legacyBase: priceTierSchema.optional(),
+  cacheHit: num.optional(), cacheMiss: num.optional(), legacy: z.boolean().optional(),
+  offPeak: priceTierSchema.optional(), peak: priceTierSchema.optional(), legacyBase: priceTierSchema.optional(),
   rateHistory: z.array(rateHistorySchema).max(16).optional(),
 })
+const priceCatalogSchema = z.record(z.string(), z.record(z.string(), z.record(z.string(), catalogEntrySchema)))
 
 const priceSchema = z.object({
+  ...multiplierShape,
   cacheHit: num,
   cacheMiss: num,
   cacheWrite: z.number().nonnegative().optional(),
   longContext: longContextSchema.optional(),
   output: num,
   reasoning: num.optional(),
-  billingMode: z.enum(['flat', 'deepseek-peak', 'batch']).optional(),
+  billingMode: z.enum(['flat', 'deepseek-peak', 'utc-peak', 'batch']).optional(),
   offPeak: priceTierSchema.optional(),
   peak: priceTierSchema.optional(),
   legacy: z.boolean().optional(),
@@ -129,11 +215,15 @@ const configSchema = z.object({
   symbol: z.string(),
   decimals: num,
   exchangeRate: num,
+  exchangeRateAuto: z.boolean().optional(),
+  fxRates: z.object({ USD: num, CNY: num, EUR: num }).optional(),
+  exchangeRateCheckedAt: num.optional(), exchangeRateDate: z.string().optional(),
   // 官方价格币种(issue #47):USD(美元官方价) | CNY(人民币官方价,按汇率折算入账)。
   pricingCurrency: z.enum(['USD', 'CNY']).optional(),
   peakEnabled: z.boolean(),
   peakEffectiveAt: z.string(),
   peakWindows: z.array(z.object({ start: num, end: num })),
+  peakHolidays: z.array(z.string()),
   peakNotice: z.boolean().optional(),
   // 峰/谷切换前弹窗提醒:开关(默认开)/提前分钟数(1-30)/类型(峰|谷|两者)。
   peakAlertEnabled: z.boolean().optional(),
@@ -144,11 +234,21 @@ const configSchema = z.object({
   showSessionId: z.boolean().optional(),
   // UI 隐藏开关(issues #45/#46):开启后官方余额/今日消耗金额的对应 UI 区块整体不渲染。
   hideOfficialBalance: z.boolean().optional(),
+  hideBudget: z.boolean().optional(),
   hideTodayCost: z.boolean().optional(),
+  hideSessionCostHeader: z.boolean().optional(),
+  hideSessionCostDock: z.boolean().optional(),
+  hideTurnCost: z.boolean().optional(),
+  sessionCostCompact: z.boolean().optional(),
+  contextCostsEnabled: z.boolean().optional(),
+  contextCostsPromptSeen: z.boolean().optional(),
+  sidebarTodayMetric: z.enum(['cost', 'tokens']).optional(),
   // 「含 Plan 总额」全局开关(v1.6.0):开启后全部金额展示按总等值(cost)计。
+  statisticsBasis: z.enum(['auto', 'api', 'plan', 'total']).optional(),
   showTotalWithPlan: z.boolean().optional(),
   includeSubagentCost: z.boolean().optional(),
   codexQuotaEnabled: z.boolean().optional(),
+  codexQuotaSidebar: z.boolean().optional(),
   sidebarSimple: z.boolean().optional(),
   sidebarSimplePromptSeen: z.boolean().optional(),
   sidebarModels: z.object({ enabled: z.boolean(), period: z.enum(['today', 'history']), topN: z.number().int().min(1).max(10), summary: z.enum(['total', 'top']), position: z.enum(['first', 'afterBalance', 'last']), defaultOpen: z.boolean(), remember: z.boolean(), tokens: z.boolean(), shares: z.boolean(), refreshSeconds: z.number().int().min(10).max(60), dock: z.boolean() }).strict().optional(),
@@ -160,13 +260,17 @@ const configSchema = z.object({
   priceMatch: z.enum(['auto', 'exact']).optional(),
   priceOverrides: z.record(z.string(), z.string()).optional(),
   priceTableDisplay: z.record(z.string(), z.boolean()).optional(),
+  // prices 可缺席:轮询路径在客户端已持有同一版本时会省略整张价格表(占载荷
+  // 56%,实测 157.4/281.5 KB),客户端按 pricesRev 沿用它自己的上一份。
+  // 显式 RPC 与首次加载一律携带完整 prices,故旧客户端不受影响。
   prices: z.object({
+    custom: z.record(z.string(), priceTierSchema.extend({ ...multiplierShape, currency: z.enum(['USD', 'CNY']), billingMode: z.literal('flat').optional() })).optional(),
     // 价表币种标记(issue #47,fetchPrices 写入;zod 默认 strip 未知键,须显式声明才能下发)。
     currency: z.enum(['USD', 'CNY']).optional(),
     models: z.record(z.string(), priceSchema),
     default: priceSchema,
     providers: z.record(z.string(), z.object({ models: z.record(z.string(), providerPriceSchema) })).optional(),
-  }),
+  }).optional(),
   budget: z.object({
     enabled: z.boolean(),
     amount: num,
@@ -181,10 +285,13 @@ const configSchema = z.object({
     refreshMinutes: num.optional(),
     apiKey: z.string().optional(),
     baseUrl: z.string().optional(),
+    orgId: z.string().optional(),
+    workspaceId: z.string().optional(),
+    factoryPool: z.enum(['standard', 'core', 'both']).optional(),
     // SCNet 本地计量专用(issue #26):月度 Credits 额度与订阅起始日;其余厂商无此二键。
     planCredits: num.optional(),
     planStart: z.string().optional(),
-    quotaSource: z.enum(['local', 'cli']).optional(),
+    quotaSource: z.enum(['local', 'cli', 'bailian']).optional(),
     // 千问 Token Plan 抵扣率覆盖(issue #78):归一模型名 → 三费率;仅千问有此键。
     rates: z.record(z.string(), z.object({
       input: num,
@@ -221,12 +328,13 @@ const configSchema = z.object({
     keySource: z.string().optional(),
   }),
   customBalance: z.object({
-    adapter: z.enum(['custom', 'aliyun']).optional(),
+    adapter: z.enum(['custom', 'aliyun', 'tokenrhythm']).optional(),
     enabled: z.boolean(),
     label: z.string(),
     labelEn: z.string().optional(),
     display: z.enum(['sidebar', 'settings', 'both', 'off']),
     unit: z.enum(['USD', 'CNY', 'EUR', 'CREDITS']).optional(),
+    convertToDisplayCurrency: z.boolean().optional(),
     refreshMinutes: num,
     request: z.object({
       url: z.string(),
@@ -240,12 +348,13 @@ const configSchema = z.object({
   // 多配置形态(v1.7.0,issue #79):自定义 Provider 余额多条并行,数组为运行期
   // 真源;customBalance 单配置键仅为旧客户端兼容保留(= entries[0] 的镜像)。
   customBalances: z.array(z.object({
-    adapter: z.enum(['custom', 'aliyun']).optional(),
+    adapter: z.enum(['custom', 'aliyun', 'tokenrhythm']).optional(),
     enabled: z.boolean(),
     label: z.string(),
     labelEn: z.string().optional(),
     display: z.enum(['sidebar', 'settings', 'both', 'off']),
     unit: z.enum(['USD', 'CNY', 'EUR', 'CREDITS']).optional(),
+    convertToDisplayCurrency: z.boolean().optional(),
     refreshMinutes: num,
     request: z.object({
       url: z.string(),
@@ -302,6 +411,7 @@ const configSchema = z.object({
   planBilling: z.object({
     providers: z.record(z.string(), z.enum(['auto', 'plan', 'api'])),
     models: z.record(z.string(), z.enum(['plan', 'api'])),
+    modelPlans: z.record(z.string(), z.enum(['opendesign', 'anthropic', 'zai', 'minimax', 'kimi', 'openrouter', 'siliconflow', 'commandcode', 'scnet', 'volcengine', 'qwen', 'mimo', 'factory', 'go', 'codex', 'volcengine-agent', 'tencent-coding', 'tencent-token', 'baidu-coding'])).optional(),
   }).optional(),
   historyDays: num,
   fetchedAt: z.union([z.string(), z.null()]),
@@ -309,6 +419,8 @@ const configSchema = z.object({
 })
 
 const balanceSchema = z.object({
+  keyConfigured: z.boolean().optional(),
+  keySource: z.string().optional(),
   status: z.enum(['off', 'ok', 'error']),
   message: z.string(),
   fetchedAt: num,
@@ -388,17 +500,22 @@ const codingPlanSchema = z.object({
   // v1.6.8 起恒为空串(密钥已改由 DSH 凭据库托管):仅保留字段以兼容旧客户端。
   apiKey: z.string(),
   baseUrl: z.string().optional(),
+  orgId: z.string().optional(),
+  workspaceId: z.string().optional(),
+  factoryPool: z.enum(['standard', 'core', 'both']).optional(),
   // 密钥配置状态(v1.6.8):是否已在凭据库中配置,以及来自哪一层(env / file / legacy)。
   keyConfigured: z.boolean().optional(),
   keySource: z.string().optional(),
   status: z.enum(['off', 'ok', 'error']),
   message: z.string(),
   fetchedAt: num,
-  windows: z.record(z.string(), z.object({ percent: num.optional(), resetsAt: z.string(), text: z.string().optional() })),
+  windows: z.record(z.string(), z.object({ percent: num.optional(), resetsAt: z.string(), text: z.string().optional(), unlimited: z.boolean().optional() })),
+  // 百炼 CLI 缺少额度查询所需的控制台凭据时显示登录按钮。
+  loginRequired: z.boolean().optional(),
   // 本地计量配置透传(仅 scnet / qwen 有;settings 页编辑入口需要看到当前值)。
   planCredits: num.optional(),
   planStart: z.string().optional(),
-  quotaSource: z.enum(['local', 'cli']).optional(),
+  quotaSource: z.enum(['local', 'cli', 'bailian']).optional(),
   rates: z.record(z.string(), z.object({
     input: num,
     cachedInput: num,
@@ -467,11 +584,20 @@ export const stateSchema = z.object({
   // Token Plan 统计(issue #64);缺席 = 旧快照/降级路径。
   planStats: planStatsSchema.optional(),
   history: z.array(daySchema),
+  externalUsage: externalUsageSchema.optional(),
+  billionContext: z.object({ protocol: num, connected: z.boolean(), failed: z.boolean(), requests: num, unreported: num, partial: num, uncovered: num,
+    detected: z.boolean().optional(), version: z.string().optional(), compatibility: z.enum(['unknown', 'ready', 'needs_update', 'changed', 'bridge_missing']).optional(), noticeId: z.string().optional() }).optional(),
   config: configSchema,
-  priceCatalog: z.record(z.string(), z.record(z.string(), z.record(z.string(), catalogEntrySchema))).optional(),
+  // 价格表版本号(宿主进程内唯一前缀 + 递增计数):客户端回传该值,一致时宿主
+  // 省略 config.prices(占轮询载荷 56%)。缺席 = 旧宿主,客户端照常收全量。
+  pricesRev: z.string().optional(),
+  // 手改过价格的 OpenRouter 模型 id:前端标注「已自定义 · 不会被自动同步覆盖」。
+  // 与刷新跳过覆盖的判定同源;无锁定时不下发本字段(旧快照兼容)。
+  priceLockIds: z.array(z.string()).optional(),
   // 存量密钥迁移提示(v1.6.8):仅在有密钥未能自动导入凭据库时出现,值为环境变量名。
   secretMigration: z.object({ pending: z.array(z.string()) }).optional(),
   meta: z.object({
+    locale: z.enum(['zh', 'en']).optional(),
     now: num,
     timezoneOffsetMinutes: num,
     // 宿主机 IANA 时区名(issue #74):与浏览器时区错位时前端显示提示;缺席 = 宿主取不到时区名。
@@ -483,6 +609,15 @@ export const stateSchema = z.object({
 
 const patchSchema = z.record(z.string(), z.unknown())
 
+const openRouterCatalogSchema = z.object({
+  fetchedAt: z.string(), stale: z.boolean(), error: z.string(),
+  models: z.array(z.object({
+    id: z.string(), name: z.string(), contextLength: z.number().int().nonnegative().nullable(),
+    input: z.number().nonnegative(), output: z.number().nonnegative(),
+    cachedInput: z.number().nonnegative().nullable(), cacheWrite: z.number().nonnegative().nullable(),
+  })),
+})
+
 const fetchPricesSchema = z.object({
   ok: z.boolean(),
   message: z.string(),
@@ -493,6 +628,9 @@ const strictCodec = (name, schema) => ({ mode: 'strict', typeSymbol: 'dsh-cost-m
 const _state$codec = strictCodec('CostState', stateSchema)
 const _patch$codec = strictCodec('ConfigPatch', patchSchema)
 const _fetch$codec = strictCodec('FetchPricesResult', fetchPricesSchema)
+const _repricingHistory$codec = strictCodec('RepricingHistory', z.array(z.object({ ...Object.fromEntries(['at', 'before', 'after', 'days', 'sessions', 'skipped'].map(key => [key, z.number().finite().nonnegative()])), ...Object.fromEntries(['beforeCny', 'afterCny', 'beforeEur', 'afterEur'].map(key => [key, z.number().finite().nonnegative().optional()])), model: z.string().optional() })))
+const _repricingConfirmation$codec = strictCodec('RepricingConfirmation', z.boolean())
+const _repricingModel$codec = strictCodec('RepricingModel', z.string().min(3).max(2048).refine(value => value.indexOf(':') > 0 && !value.endsWith(':') && !/[\r\n]/.test(value)))
 const _provider$codec = strictCodec('CodingPlanProvider', z.string())
 const _gatewaySourceId$codec = strictCodec('GatewayQuotaSourceId', z.string().optional())
 // 密钥目标(v1.6.8):'goQuota' | 'codingPlans.<id>' | 'codingPlans.volcengine.ak' | '...sk'
@@ -507,12 +645,20 @@ const _sort$codec = strictCodec('SessionSort', z.string())
 const _dir$codec = strictCodec('SessionSortDir', z.string())
 const _sessionId$codec = strictCodec('SessionId', z.string().min(1).max(512))
 const _sessionCost$codec = strictCodec('SessionCost', sessionCostSchema)
+const _turnCost$codec = strictCodec('TurnCost', turnCostSchema)
+const _turnSeq$codec = strictCodec('TurnSeq', z.number().int().nonnegative())
 
 export const TYPERT = {
   package: 'dsh-cost-meter',
   face: 'host',
   schemas: [],
   invocations: [
+    { id: 'dsh-cost-meter#costMeter/getContextIntegration', service: 'costMeter', namespace: 'costMeter', method: 'getContextIntegration', invocation: { kind: 'direct' }, parameters: [],
+      result: strictCodec('ContextIntegration', z.object({ version: z.string(), compatible: z.boolean(), reason: z.enum(['ready', 'missing', 'unsupported', 'unavailable']) })) },
+    {
+      id: 'dsh-cost-meter#costMeter/getOpenRouterCatalog', service: 'costMeter', namespace: 'costMeter', method: 'getOpenRouterCatalog',
+      invocation: { kind: 'direct' }, parameters: [], result: strictCodec('OpenRouterCatalog', openRouterCatalogSchema),
+    },
     {
       id: 'dsh-cost-meter#costMeter/getState',
       service: 'costMeter',
@@ -522,6 +668,13 @@ export const TYPERT = {
       parameters: [],
       result: _state$codec,
     },
+    { id: 'dsh-cost-meter#costMeter/getStateSince', service: 'costMeter', namespace: 'costMeter', method: 'getStateSince', invocation: { kind: 'direct' },
+      parameters: [{ name: 'pricesRev', wire: 'pricesRev', source: 'json', codec: strictCodec('PricesRev', z.string()) }], result: _state$codec },
+    { id: 'dsh-cost-meter#costMeter/getLocalState', service: 'costMeter', namespace: 'costMeter', method: 'getLocalState', invocation: { kind: 'direct' }, parameters: [], result: _state$codec },
+    { id: 'dsh-cost-meter#costMeter/getRepricingHistory', service: 'costMeter', namespace: 'costMeter', method: 'getRepricingHistory', invocation: { kind: 'direct' }, parameters: [], result: _repricingHistory$codec },
+    { id: 'dsh-cost-meter#costMeter/getPriceCatalog', service: 'costMeter', namespace: 'costMeter', method: 'getPriceCatalog', invocation: { kind: 'direct' }, parameters: [], result: strictCodec('PriceCatalog', priceCatalogSchema) },
+    { id: 'dsh-cost-meter#costMeter/repriceHistory', service: 'costMeter', namespace: 'costMeter', method: 'repriceHistory', invocation: { kind: 'direct' }, parameters: [{ name: 'confirmed', wire: 'confirmed', source: 'json', codec: _repricingConfirmation$codec }], result: _fetch$codec },
+    { id: 'dsh-cost-meter#costMeter/repriceModelHistory', service: 'costMeter', namespace: 'costMeter', method: 'repriceModelHistory', invocation: { kind: 'direct' }, parameters: [{ name: 'confirmed', wire: 'confirmed', source: 'json', codec: _repricingConfirmation$codec }, { name: 'model', wire: 'model', source: 'json', codec: _repricingModel$codec }], result: _fetch$codec },
     {
       id: 'dsh-cost-meter#costMeter/updateConfig',
       service: 'costMeter',
@@ -540,6 +693,17 @@ export const TYPERT = {
       method: 'fetchPrices',
       invocation: { kind: 'direct' },
       parameters: [],
+      result: _fetch$codec,
+    },
+    {
+      id: 'dsh-cost-meter#costMeter/releasePriceLock',
+      service: 'costMeter',
+      namespace: 'costMeter',
+      method: 'releasePriceLock',
+      invocation: { kind: 'direct' },
+      parameters: [
+        { name: 'id', wire: 'id', source: 'json', codec: strictCodec('PriceLockId', z.string().min(1)) },
+      ],
       result: _fetch$codec,
     },
     {
@@ -585,6 +749,17 @@ export const TYPERT = {
       service: 'costMeter',
       namespace: 'costMeter',
       method: 'refreshCodingPlan',
+      invocation: { kind: 'direct' },
+      parameters: [
+        { name: 'provider', wire: 'provider', source: 'json', codec: _provider$codec },
+      ],
+      result: _fetch$codec,
+    },
+    {
+      id: 'dsh-cost-meter#costMeter/loginCodingPlan',
+      service: 'costMeter',
+      namespace: 'costMeter',
+      method: 'loginCodingPlan',
       invocation: { kind: 'direct' },
       parameters: [
         { name: 'provider', wire: 'provider', source: 'json', codec: _provider$codec },
@@ -658,6 +833,26 @@ export const TYPERT = {
       result: _sessionCost$codec,
     },
     {
+      id: 'dsh-cost-meter#costMeter/getTurnCost', service: 'costMeter', namespace: 'costMeter', method: 'getTurnCost',
+      invocation: { kind: 'direct' },
+      parameters: [{ name: 'sessionId', wire: 'sessionId', source: 'json', codec: _sessionId$codec }, { name: 'startSeq', wire: 'startSeq', source: 'json', codec: _turnSeq$codec }, { name: 'endSeq', wire: 'endSeq', source: 'json', codec: _turnSeq$codec }, { name: 'displayCurrency', wire: 'displayCurrency', source: 'json', acceptsUndefined: true, codec: strictCodec('DisplayCurrency', z.enum(['USD', 'CNY', 'EUR']).optional()) }],
+      result: _turnCost$codec,
+    },
+    ...[['getBillingStatistics', 'BillingStatistics', billingStatisticsSchema], ['getSessionBilling', 'SessionBilling', sessionBillingSchema]].map(([method, name, schema]) => ({
+      id: 'dsh-cost-meter#costMeter/' + method, service: 'costMeter', namespace: 'costMeter', method, invocation: { kind: 'direct' },
+      parameters: [{ name: 'query', wire: 'query', source: 'json', codec: strictCodec('StatisticsQuery', statisticsQuerySchema) }],
+      result: strictCodec(name, schema),
+    })),
+    { id: 'dsh-cost-meter#costMeter/getTurnInspection', service: 'costMeter', namespace: 'costMeter', method: 'getTurnInspection', invocation: { kind: 'direct' },
+      parameters: [{ name: 'query', wire: 'query', source: 'json', codec: strictCodec('TurnInspectionQuery', turnInspectionQuerySchema) }], result: strictCodec('TurnInspection', turnInspectionSchema) },
+    { id: 'dsh-cost-meter#costMeter/getCallInspection', service: 'costMeter', namespace: 'costMeter', method: 'getCallInspection', invocation: { kind: 'direct' },
+      parameters: [{ name: 'query', wire: 'query', source: 'json', codec: strictCodec('CallInspectionQuery', callInspectionQuerySchema) }], result: strictCodec('CallInspection', callInspectionSchema) },
+    ...[['getSessionTrajectory', 'Trajectory', trajectoryQuerySchema, trajectorySchema]].map(([method, name, query, schema]) => ({
+      id: 'dsh-cost-meter#costMeter/' + method, service: 'costMeter', namespace: 'costMeter', method, invocation: { kind: 'direct' },
+      parameters: [{ name: 'query', wire: 'query', source: 'json', codec: strictCodec(name + 'Query', query) }], result: strictCodec(name, schema) })),
+    { id: 'dsh-cost-meter#costMeter/getContextCosts', service: 'costMeter', namespace: 'costMeter', method: 'getContextCosts', invocation: { kind: 'direct' },
+      parameters: [{ name: 'query', wire: 'query', source: 'json', codec: strictCodec('ContextCostsQuery', contextCostsQuerySchema) }], result: strictCodec('ContextCosts', contextCostsSchema) },
+    {
       // 写入一枚密钥到 DSH 凭据库(v1.6.8):密钥不再经 updateConfig 传递,值只进凭据库。
       id: 'dsh-cost-meter#costMeter/setCredential',
       service: 'costMeter',
@@ -693,6 +888,7 @@ export const TYPERT = {
         key: 'costMeter',
         exportName: 'CostMeterService',
         members: [
+          { kind: 'method', name: 'getStateSince', signature: 'getStateSince(pricesRev: string): Promise<CostState>', summary: '按已知价格版本读取状态。Read state with a known price revision.' },
           {
             kind: 'method',
             name: 'getState',
@@ -713,6 +909,21 @@ export const TYPERT = {
             signature: 'fetchPrices(): Promise<FetchPricesResult>',
             summary: '抓取官方定价页并应用解析出的价格。Fetch the official pricing page and apply the parsed prices.',
             jsDoc: '/**\n * 抓取官方定价页并应用解析出的价格。\n * @returns 抓取与应用结果。\n * Fetch the official pricing page and apply the parsed prices.\n * @returns The fetch-and-apply result.\n */',
+          },
+          { kind: 'method', name: 'getRepricingHistory', signature: 'getRepricingHistory(): Promise<RepricingHistory>', summary: '读取历史重算前后的金额。Read original and recalculated amounts.' },
+          { kind: 'method', name: 'getPriceCatalog', signature: 'getPriceCatalog(): Promise<PriceCatalog>', summary: '按需读取可恢复的内置价格。Read bundled prices on demand.' },
+          { kind: 'method', name: 'repriceHistory', signature: 'repriceHistory(confirmed: boolean): Promise<FetchPricesResult>', summary: '确认并备份后按当前价格重算历史。Recalculate history after explicit confirmation and backup.' },
+          { kind: 'method', name: 'repriceModelHistory', signature: 'repriceModelHistory(confirmed: boolean, model: string): Promise<FetchPricesResult>', summary: '确认并备份后只重算指定渠道模型，保留同期汇率。Recalculate one channel/model with original exchange rates.' },
+          {
+            kind: 'method', name: 'getOpenRouterCatalog', signature: 'getOpenRouterCatalog(): Promise<OpenRouterCatalog>',
+            summary: '只读查询公开模型价格，无需密钥。Read public model prices without credentials or config changes.',
+          },
+          {
+            kind: 'method',
+            name: 'releasePriceLock',
+            signature: 'releasePriceLock(id: string): Promise<FetchPricesResult>',
+            summary: '把手改过的 OpenRouter 价格交回自动同步。Hand a manually edited OpenRouter price back to auto-sync.',
+            jsDoc: '/**\n * 把手改过的 OpenRouter 价格交回自动同步。\n * @param id - OpenRouter 模型 id。\n * @returns 结果与最新快照。\n * Hand a manually edited OpenRouter price back to auto-sync.\n * @param id - The OpenRouter model id.\n * @returns The result and the latest snapshot.\n */',
           },
           {
             kind: 'method',
@@ -772,6 +983,12 @@ export const TYPERT = {
           },
           {
             kind: 'method',
+            name: 'getTurnCost',
+            signature: 'getTurnCost(sessionId: string, startSeq: number, endSeq: number): TurnCost',
+            summary: '读取已完成轮次的分项用量与估算费用。Read recorded usage and estimated costs for a completed turn.',
+          },
+          {
+            kind: 'method',
             name: 'getSessionCost',
             signature: 'getSessionCost(sessionId: string): SessionCost',
             summary: '读取本会话跨日期账本及可选的子代理费用汇总。Read a session ledger and optional descendant costs.',
@@ -782,7 +999,7 @@ export const TYPERT = {
             name: 'setCredential',
             signature: 'setCredential(target: CredentialTarget, value: CredentialValue): Promise<FetchPricesResult>',
             summary: '把一枚密钥写入 DSH 凭据库。Store a credential in the DSH credential store.',
-            jsDoc: '/**\n * 把一枚密钥写入 DSH 凭据库(v1.6.8)。密钥不再经 updateConfig 传递:\n * config 中的密钥字段只留空占位(且不落盘),值一律存进宿主凭据库。\n * v1.7.6 新增 customVar:<NAME> 目标:自定义余额请求头 {{VAR}} 占位符的同名密钥\n * 也走这一入口写入,与模型页共享变量名即共用同一把密钥。\n * @param target - goQuota | codingPlans.<id> | codingPlans.volcengine.ak | codingPlans.volcengine.sk | customVar:VAR_NAME\n * @param value - 密钥明文(非空)\n * @returns 写入结果与最新快照\n * Store a credential in the DSH credential store (v1.6.8). Credentials no longer travel\n * through updateConfig: config keeps blank placeholders only (and never persists them).\n * v1.7.6 adds the customVar:<NAME> target: keys for custom-balance header {{VAR}}\n * placeholders are stored through this same entry; sharing a variable name with the\n * Models page shares the same key.\n * @param target - goQuota | codingPlans.<id> | codingPlans.volcengine.ak | codingPlans.volcengine.sk | customVar:VAR_NAME\n * @param value - The plaintext credential (non-empty)\n * @returns The write result and the latest snapshot\n */',
+            jsDoc: '/**\n * 把一枚密钥写入 DSH 凭据库(v1.6.8)。密钥不再经 updateConfig 传递:\n * config 中的密钥字段只留空占位(且不落盘),值一律存进宿主凭据库。\n * v1.7.6 新增 customVar:<NAME> 目标:自定义余额请求头 {{VAR}} 占位符的同名密钥\n * 也走这一入口写入,与模型页共享变量名即共用同一把密钥。\n * @param target - balance | goQuota | codingPlans.<id> | codingPlans.volcengine.ak | codingPlans.volcengine.sk | customVar:VAR_NAME\n * @param value - 密钥明文(非空)\n * @returns 写入结果与最新快照\n * Store a credential in the DSH credential store (v1.6.8). Credentials no longer travel\n * through updateConfig: config keeps blank placeholders only (and never persists them).\n * v1.7.6 adds the customVar:<NAME> target: keys for custom-balance header {{VAR}}\n * placeholders are stored through this same entry; sharing a variable name with the\n * Models page shares the same key.\n * @param target - balance | goQuota | codingPlans.<id> | codingPlans.volcengine.ak | codingPlans.volcengine.sk | customVar:VAR_NAME\n * @param value - The plaintext credential (non-empty)\n * @returns The write result and the latest snapshot\n */',
           },
           {
             kind: 'method',

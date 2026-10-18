@@ -35,8 +35,6 @@ export declare const zh: {
     changesMdRaw: string;
     changesHtmlRender: string;
     changesHtmlRaw: string;
-    changesPdfRender: string;
-    changesPdfRaw: string;
     changesWrite: string;
     changesEdit: string;
     changesRunning: string;
@@ -60,6 +58,11 @@ export declare const zh: {
     editorExplorerMergedDesc: string;
     editorExplorerSplit: string;
     editorExplorerSplitDesc: string;
+    explorerExclude: string;
+    explorerExcludeDesc: string;
+    explorerExcludePlaceholder: string;
+    explorerExcludeAdd: string;
+    explorerExcludeRemove: string;
     editorTreeToggle: string;
     editorPathPlaceholder: string;
     editorSearchPlaceholder: string;
@@ -68,6 +71,12 @@ export declare const zh: {
     editorEmptyHint: string;
     openFileNewTab: string;
     openFileSide: string;
+    settingsOpenWithPluginTitle: string;
+    settingsOpenWithPluginDesc: string;
+    zipDownload: string;
+    zipDownloadCount: string;
+    zipFailed: string;
+    archiveToolMissing: string;
     openWithMenu: string;
     openWithSshSuffix: string;
     pinOpenWith: string;
@@ -88,30 +97,52 @@ export declare const zh: {
     openWithSettingsFamilyDesc: string;
     openWithSettingsRemove: string;
     openWithSettingsInvalidHint: string;
+    openInAppDefault: string;
+    openInAppEmpty: string;
+    openInAppFailed: string;
+    revealInFileManager: string;
+    filesSelected: string;
+    clearSelection: string;
+    copyPaths: string;
+    deleteSelected: string;
+    deleteSelectedTitle: string;
+    deleteSelectedDesc: string;
+    newFolder: string;
+    newFolderPlaceholder: string;
+    newFolderInvalid: string;
+    newFile: string;
+    newFilePlaceholder: string;
+    newFileInvalid: string;
+    newFileExists: string;
+    sort: string;
+    sortByName: string;
+    sortByType: string;
+    sortFoldersFirst: string;
+    filesTruncated: string;
+    gitStatusModified: string;
+    gitStatusAdded: string;
+    gitStatusDeleted: string;
+    gitStatusUntracked: string;
+    gitStatusRenamed: string;
+    gitStatusConflict: string;
+    changesClean: string;
+    changesNewFile: string;
+    changesStageFailed: string;
+    changesOpGone: string;
     newTab: string;
-    openExplorer: string;
     brokenSymlink: string;
-    openGit: string;
-    newTerminal: string;
-    terminalLimit: string;
     close: string;
     closeOtherTabs: string;
+    tabUnread: string;
     closeLeftTabs: string;
     closeRightTabs: string;
-    floatDropHint: string;
-    dockToSidebar: string;
+    closeAllTabs: string;
+    revealTabInFileManager: string;
     pinTerminal: string;
     pinAgentTerminal: string;
     pinToWorkspace: string;
     pinToGlobal: string;
     unpinTerminal: string;
-    pinnedTerminalTooltip: string;
-    pinnedTerminalKindUi: string;
-    pinnedTerminalKindAgent: string;
-    pinnedTerminalScopeWorkspace: string;
-    pinnedTerminalScopeGlobal: string;
-    pinnedRailLabel: string;
-    closePinnedTerminal: string;
     collapseBottomPanel: string;
     expandBottomPanel: string;
     terminalError: string;
@@ -123,6 +154,9 @@ export declare const zh: {
     terminalDepsHint: string;
     terminalDepsProfile: string;
     terminalShellNotFound: string;
+    terminalUnavailable: string;
+    terminalGone: string;
+    terminalNew: string;
     preview: string;
     toc: string;
     edit: string;
@@ -133,39 +167,109 @@ export declare const zh: {
     mermaidZoomHint: string;
     refresh: string;
     refreshUnsavedConfirm: string;
+    closeUnsavedConfirm: string;
     save: string;
     saved: string;
     unsaved: string;
     saveFailed: string;
-    truncation: string;
+    saveConflict: string;
+    saveConflictReload: string;
+    previewOnlyNotice: string;
+    largeFileEmpty: string;
+    pagedLineRange: string;
+    loadAll: string;
+    loadAllProgress: string;
+    previewRowLimit: string;
+    jsonlRecordRange: string;
+    jsonlInvalidRecord: string;
+    jsonCopyPath: string;
+    jsonCopyPrettyJson: string;
+    jsonCopyCompactJson: string;
+    jsonCopyFailed: string;
+    jsonCollapseNode: string;
+    jsonExpandNode: string;
+    jsonCopyButtonTitle: string;
+    searchFind: string;
+    searchReplace: string;
+    searchNext: string;
+    searchPrevious: string;
+    searchAll: string;
+    searchMatchCase: string;
+    searchWholeWord: string;
+    searchRegexp: string;
+    searchReplaceAll: string;
+    searchCurrentMatch: string;
+    searchOnLine: string;
+    searchReplacedMatches: string;
+    searchReplacedMatchOnLine: string;
+    searchGoToLine: string;
+    searchGo: string;
     binary: string;
     loading: string;
     error: string;
     retry: string;
-    splitLeft: string;
-    splitRight: string;
-    splitUp: string;
-    splitDown: string;
     notRepo: string;
-    noChanges: string;
     statusTruncated: string;
     stage: string;
     unstage: string;
     stageAll: string;
     unstageAll: string;
+    gitChanges: string;
+    gitGraph: string;
+    gitMergeChanges: string;
+    gitStagedChanges: string;
+    gitMoreActions: string;
+    gitRepository: string;
+    gitDetached: string;
+    gitBranchesUnavailable: string;
+    gitNoUpstream: string;
+    gitSyncUnavailable: string;
+    gitSync: string;
     commitPlaceholder: string;
     commit: string;
-    commitError: string;
+    generateCommitMessage: string;
+    generateCommitMessageWith: string;
+    generatingCommitMessage: string;
+    committingMessage: string;
+    suggestCommitError: string;
+    suggestCommitEmpty: string;
+    commitModelTitle: string;
+    commitModelDesc: string;
+    commitModelFollow: string;
+    commitModelSearchPlaceholder: string;
+    commitModelCurrent: string;
+    commitModelInvalid: string;
+    commitModelUnavailable: string;
+    commitModelEmpty: string;
+    commitModelDefaultNote: string;
+    commitModelRecentNote: string;
+    push: string;
+    pull: string;
+    pushError: string;
+    pullError: string;
     branch: string;
     worktree: string;
     checkoutError: string;
     history: string;
     changes: string;
     changesGitLens: string;
+    graphAllBranches: string;
+    graphBranchFilter: string;
+    graphEmpty: string;
+    graphLoadError: string;
+    graphStale: string;
+    graphDetails: string;
+    graphParents: string;
+    graphLoadMore: string;
     changesSessionLens: string;
     changesFilterAll: string;
     changesFilterEmpty: string;
     changesOpenDiffTab: string;
+    changesDiffTab: string;
+    changesContentTab: string;
+    changesNoCommit: string;
+    changesNoContent: string;
+    changesReadNoDiff: string;
     changesClosePreview: string;
     changesResizePreview: string;
     changesLoadError: string;
@@ -179,7 +283,6 @@ export declare const zh: {
     diffDeleted: string;
     diffRenamed: string;
     diffExpand: string;
-    diffCollapse: string;
     discard: string;
     discardTitle: string;
     discardDesc: string;
@@ -198,21 +301,16 @@ export declare const zh: {
     timeHoursAgo: string;
     timeYesterday: string;
     loadMore: string;
-    historyLoadError: string;
     produced: string;
-    producedOpen: string;
     showInFolder: string;
     disconnected: string;
     exited: string;
     noSession: string;
     pluginNotLoaded: string;
-    hiddenFiles: string;
     parent: string;
     copied: string;
     copy: string;
-    newFile: string;
     openEditor: string;
-    gitDetail: string;
     referenceFile: string;
     addToConversation: string;
     copyRelative: string;
@@ -244,19 +342,7 @@ export declare const zh: {
     settingsDone: string;
     settingsOpenToolsTitle: string;
     settingsOpenToolsDesc: string;
-    settingsTitleBarTitle: string;
-    settingsTitleBarDesc: string;
-    settingsTitleBarStripTitle: string;
-    settingsTitleBarStripDesc: string;
-    settingsSchemeAutoTitle: string;
-    settingsSchemeAutoDesc: string;
-    settingsSchemeWebTitle: string;
-    settingsSchemeWebDesc: string;
-    settingsSchemeCustomTitle: string;
-    settingsSchemeCustomDesc: string;
-    settingsSchemeDetectedSuffix: string;
     settingsCustomCssTitle: string;
-    settingsCustomCssDesc: string;
     settingsCustomCssPlaceholder: string;
     settingsSaveFailed: string;
     settingsConflict: string;
@@ -268,10 +354,6 @@ export declare const zh: {
     settingsJobsDesc: string;
     settingsToolsTitle: string;
     settingsToolsDesc: string;
-    settingsFenceTitle: string;
-    settingsFenceDesc: string;
-    fenceErrorReason: string;
-    fenceDisableAction: string;
     settingsBottomTerminalTitle: string;
     settingsBottomTerminalDesc: string;
     settingsFontFamilyTitle: string;
@@ -279,7 +361,6 @@ export declare const zh: {
     settingsFontFamilyPlaceholder: string;
     settingsFontSizeTitle: string;
     settingsFontSizeDesc: string;
-    settingsFontSizeSuffix: string;
     settingsShellTitle: string;
     settingsShellDesc: string;
     settingsShellPlaceholder: string;
@@ -288,15 +369,18 @@ export declare const zh: {
     settingsShellArgsPlaceholder: string;
     settingsTabsTitle: string;
     settingsViewersTitle: string;
+    settingsMobileTitle: string;
+    settingsMobileNoAutoOpenTitle: string;
+    settingsMobileNoAutoOpenDesc: string;
+    settingsMobileTreeTitle: string;
+    settingsMobileTreeDesc: string;
     settingsGeneralTitle: string;
     settingsPopup: string;
     settingsViewerCatchAll: string;
-    viewerImage: string;
-    viewerPdf: string;
     viewerMarkdown: string;
     viewerCode: string;
-    viewerBinary: string;
     viewerHtml: string;
+    viewerJsonl: string;
     browser: string;
     browserPlaceholder: string;
     browserGo: string;
@@ -306,7 +390,6 @@ export declare const zh: {
     browserBlockedScheme: string;
     browserBlockedLoopback: string;
     browserInvalid: string;
-    browserNoSandboxWarning: string;
     htmlNoSandboxWarning: string;
     sandboxStatusOn: string;
     sandboxUnlock: string;
@@ -315,14 +398,10 @@ export declare const zh: {
     settingsHtmlDefaultUnsafeDesc: string;
     settingsHtmlSandboxTitle: string;
     settingsHtmlSandboxDesc: string;
+    settingsEditorGitGutterTitle: string;
+    settingsEditorGitGutterDesc: string;
     settingsBrowserSandboxTitle: string;
     settingsBrowserSandboxDesc: string;
-    settingsBrowserLinksTitle: string;
-    settingsBrowserLinksDesc: string;
-    settingsBrowserHttpTitle: string;
-    settingsBrowserHttpDesc: string;
-    settingsBrowserHttpsTitle: string;
-    settingsBrowserHttpsDesc: string;
     settingsBrowserLoopbackTitle: string;
     settingsBrowserLoopbackDesc: string;
     settingsBrowserLoopbackPlaceholder: string;
@@ -331,19 +410,14 @@ export declare const zh: {
     browserEmbedBlockedDesc: string;
     browserEmbedAnyway: string;
     subagent: string;
-    openSubagent: string;
     subagentMainAgent: string;
     subagentEmpty: string;
     subagentEmptyDesc: string;
-    subagentRunning: string;
     subagentInactive: string;
     subagentModeOneShot: string;
     subagentModeContinuable: string;
     subagentCount: string;
     subagentCountRunning: string;
-    subagentDiagCorrupt: string;
-    subagentDiagUnsupported: string;
-    subagentDiagUnavailable: string;
     subagentThinking: string;
     sideChat: string;
     sideChatNew: string;
@@ -355,19 +429,25 @@ export declare const zh: {
     sideChatThreads: string;
     sideChatSave: string;
     sideChatSaveTitle: string;
+    sideChatArchive: string;
+    sideChatArchiveRunning: string;
     sideChatSaved: string;
     sideChatNoTurn: string;
     sideChatPendingDrop: string;
+    sideChatQueued: string;
+    sideChatSending: string;
+    sideChatDequeue: string;
+    sideChatRunError: string;
+    sideChatModel: string;
+    sideChatModelInherit: string;
+    sideChatReasoning: string;
     sideChatFirstPlaceholder: string;
     sideChatComposerPlaceholder: string;
     sideChatThinking: string;
     sideChatThink: string;
     sideChatInjection: string;
     sideChatSend: string;
-    sideChatCancel: string;
     sideChatCancelTitle: string;
-    sideChatClose: string;
-    sideChatCloseTitle: string;
     sideChatError: string;
     sideChatTurnUsage: string;
     sideChatBlockCollapse: string;
@@ -376,14 +456,17 @@ export declare const zh: {
     sideChatBlockExpandAria: string;
     sideChatBlockSignal: string;
     sideChatBlockExitCode: string;
+    sideChatBlockNoExitCode: string;
     sideChatBlockRunning: string;
     sideChatBlockFailed: string;
     sideChatBlockDone: string;
     sideChatBlockNoOutput: string;
-    sideChatBlockFiles: string;
+    sideChatBlockCommandLine: string;
+    codeBlockTitle: string;
+    codeBlockWrap: string;
+    codeBlockUnwrap: string;
     sideChatBlockWindow: string;
     sideChatConnDisconnected: string;
-    sideChatConnReconnect: string;
     sideChatConnConnecting: string;
     sideChatConnRecovered: string;
     sideChatConnReconnectAction: string;
@@ -400,7 +483,6 @@ export declare const zh: {
     jobDurationMinutes: string;
     jobDurationHours: string;
     jobViewOutput: string;
-    jobHideOutput: string;
     jobNoOutput: string;
     jobNotReadYet: string;
     jobOutputTruncated: string;
@@ -408,6 +490,101 @@ export declare const zh: {
     jobKill: string;
     jobKillConfirm: string;
     jobKillError: string;
+    tasksViewGraph: string;
+    tasksViewTree: string;
+    tasksViewSwitchToGraph: string;
+    tasksViewSwitchToTree: string;
+    settingsViewModeTitle: string;
+    settingsViewModeDesc: string;
+    settingsViewModeGraph: string;
+    settingsViewModeGraphDesc: string;
+    settingsViewModeTree: string;
+    settingsViewModeTreeDesc: string;
+    tasksFoldIdleGroup: string;
+    tasksFoldIdle: string;
+    tasksFoldCompleted: string;
+    tasksFoldOne: string;
+    tasksFoldExpand: string;
+    tasksFoldCollapse: string;
+    tasksZoomIn: string;
+    tasksZoomOut: string;
+    tasksZoomFit: string;
+    tasksNodeJump: string;
+    tasksNodeDetail: string;
+    workflowRun: string;
+    tasksNodeState: string;
+    tasksFoldExpandShort: string;
+    tasksTreeCollapseAll: string;
+    tasksTreeExpandAll: string;
+    tasksTreeCollapseRow: string;
+    tasksTreeExpandRow: string;
+    tasksNodeTokens: string;
+    tasksNodeDuration: string;
+    tasksNodeOpenMain: string;
+    tasksNodeMode: string;
+    tasksNodeModel: string;
+    tasksNodeTeamRole: string;
+    tasksStateRunning: string;
+    tasksStateIdle: string;
+    tasksStateProvisioning: string;
+    tasksStateDone: string;
+    tasksStateError: string;
+    tasksKindSubagent: string;
+    tasksKindTeammate: string;
+    tasksKindWorkflow: string;
+    taskWindowCreate: string;
+    taskWindowDetail: string;
+    teamBoard: string;
+    teamChip: string;
+    teamTasksEmpty: string;
+    teamTaskCreate: string;
+    teamTaskSubject: string;
+    teamTaskDescription: string;
+    teamTaskOwner: string;
+    teamTaskUnowned: string;
+    teamTaskPending: string;
+    teamTaskInProgress: string;
+    teamTaskCompleted: string;
+    teamTaskBlocked: string;
+    teamTaskClaim: string;
+    teamTaskComplete: string;
+    teamTaskReopen: string;
+    teamTaskDelete: string;
+    teamTaskDeleteConfirm: string;
+    teamTaskEdit: string;
+    teamTaskSave: string;
+    teamTaskCancel: string;
+    teamTaskConflict: string;
+    teamTaskError: string;
+    teamTaskDeleted: string;
+    teamTaskActions: string;
+    teamTaskDetail: string;
+    teamTaskNoDescription: string;
+    teamTaskBlockedBy: string;
+    teamTaskSubjectPlaceholder: string;
+    teamTaskDescriptionPlaceholder: string;
+    teamFilterAll: string;
+    tasksNodeTasks: string;
+    jobCopyOutput: string;
+    jobCopied: string;
+    jobFollowTail: string;
+    jobDragHint: string;
+    workflowRunning: string;
+    workflowCompleted: string;
+    workflowCancelled: string;
+    workflowFailed: string;
+    workflowPhaseUnnamed: string;
+    workflowMembers: string;
+    jobsAutoCollapsed: string;
+    contextDiagnostics: string;
+    contextDiagnosticsTarget: string;
+    contextDiagnosticsFailed: string;
+    contextDiagnosticsUnavailable: string;
+    contextDiagnosticsNavigation: string;
+    contextDiagnosticsTimeout: string;
+    contextDiagnosticsOpenFailed: string;
+    contextDiagnosticsDismiss: string;
+    catalogLoadFailed: string;
     addPluginsTabCard: string;
     addPluginsTabCardDesc: string;
     addPluginsViewerCard: string;
@@ -422,44 +599,56 @@ export declare const zh: {
     openPlugin: string;
     copyInstall: string;
     pluginMdExportDesc: string;
+    pluginAgentPersonaDesc: string;
     pluginOfficeDesc: string;
     pluginFlowglassDesc: string;
     pluginGitForgeDesc: string;
     pluginGithubWorkbenchDesc: string;
+    pluginIdeGitDesc: string;
     pluginSuhuangScrollDesc: string;
     pluginBetterOverleafDesc: string;
-    pluginGitRemotesDesc: string;
     pluginSentinelDesc: string;
     pluginServerDeckDesc: string;
     pluginSidebarQaDesc: string;
     pluginSidenoteDesc: string;
     pluginSshTunnelDesc: string;
-    pluginTurnReviewDesc: string;
     pluginVideoPreviewDesc: string;
+    pluginAudioDesc: string;
     pluginCodeNavDesc: string;
+    pluginDevGitGraphDesc: string;
     pluginDocsPanelDesc: string;
+    pluginTylinaDesc: string;
     pluginEgoBrowserDesc: string;
     pluginBilingualReaderDesc: string;
+    pluginDshMemoryDeltaDesc: string;
+    pluginAgentPersonaName: string;
     pluginSentinelName: string;
+    pluginFileTraceName: string;
+    pluginFileTraceDesc: string;
+    pluginMnemeName: string;
+    pluginMnemeDesc: string;
     pluginEgoBrowserName: string;
     pluginBetterOverleafName: string;
     pluginDocsPanelName: string;
+    pluginTylinaName: string;
     pluginFlowglassName: string;
     pluginGitForgeName: string;
-    pluginGitRemotesName: string;
     pluginGithubWorkbenchName: string;
+    pluginIdeGitName: string;
     pluginSidebarQaName: string;
     pluginSidenoteName: string;
     pluginServerDeckName: string;
     pluginSuhuangScrollName: string;
     pluginSshTunnelName: string;
-    pluginTurnReviewName: string;
     pluginBilingualReaderName: string;
     pluginOfficeName: string;
     pluginMdExportName: string;
     pluginCodeNavName: string;
     pluginVideoPreviewName: string;
-    presetDshDesktopDesc: string;
+    pluginAudioName: string;
+    pluginTurnOutlineName: string;
+    pluginTurnOutlineDesc: string;
+    pluginDshMemoryDeltaName: string;
 };
 /** The en dictionary (key-set-equal to zh, enforced by the type annotation). */
 export declare const en: Record<keyof typeof zh, string>;
@@ -496,7 +685,39 @@ export declare function attachLocale(service: {
     getSnapshot(): {
         active: string;
     };
+    /** Optional namespace binding ({@link chatT} needs it; a bare snapshot face is still valid). */
+    bind?(ns: string): (key: string, params?: Record<string, string | number>) => string;
 } | undefined): void;
+/**
+ * Translate a key in the HOST's own `chat` namespace — the wording the main
+ * conversation's merged "process" header uses (`message.stepProcess.*`,
+ * registered by `@deepseek-ai/dsh-client-ui-chat`). The Tasks page reads it so
+ * a running node reads exactly like the main agent's own activity line instead
+ * of inventing a second vocabulary (and without adding ~40 keys to 20 plugin
+ * dictionaries).
+ *
+ * Deliberately untyped: these keys are NOT a documented host contract. A host
+ * that renames one, or a deployment where the chat target never mounted,
+ * returns the key unchanged — the caller then falls back to its own wording
+ * ({@link chatT} answers undefined) rather than printing `message.…`.
+ *
+ * @param key - full `chat`-namespace key.
+ * @param params - `{name}` placeholders to interpolate (the host does this).
+ * @returns the translated text, or undefined when unavailable.
+ */
+export declare function chatT(key: string, params?: Record<string, string | number>): string | undefined;
+/**
+ * Translate a key in one of the HOST's own locale namespaces. Same contract
+ * and same deliberately-untyped seam as {@link chatT} — the plugin reads host
+ * wording it would otherwise have to duplicate across 20 dictionaries (the
+ * chat activity line, the open-in-app application names).
+ *
+ * @param ns - host namespace (e.g. `'open-in-app'`).
+ * @param key - full namespace key (e.g. `'app.vscode'`).
+ * @param params - `{name}` placeholders to interpolate (the host does this).
+ * @returns the translated text, or undefined when unavailable.
+ */
+export declare function hostT(ns: string, key: string, params?: Record<string, string | number>): string | undefined;
 /**
  * Attach (or detach, with undefined) the better-locale override store.
  * When attached with an active override, `t()` consults the store's
@@ -517,6 +738,16 @@ export type CopyKey = keyof typeof zh;
 export declare function t(key: CopyKey, params?: Record<string, string | number>): string;
 /** Whether the active locale is Chinese (used for selectors). */
 export declare function isZh(): boolean;
+/**
+ * A signature of the effective UI language: the DSH locale service's active
+ * id plus the better-locale override id when one is actually in force (the
+ * override only borrows DSH's `en` slot, so it is inert while DSH is on
+ * `zh`). `t()` resolves copy from exactly these two inputs, so a component
+ * that caches localized text OUTSIDE React state — e.g. CodeMirror's
+ * `phrases` facet, which is baked into an EditorState — can use this string
+ * as an effect dependency to know when to re-resolve it.
+ */
+export declare function localeSignature(): string;
 /** Format an ISO 8601 author date relative to now (刚刚 / N 分钟前 / N 小时前 / 昨天 / date). */
 export declare function relativeTime(iso: string): string;
 export {};

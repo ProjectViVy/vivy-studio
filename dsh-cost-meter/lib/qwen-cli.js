@@ -1,10 +1,8 @@
 /** Official Qianwen CLI bridge (#146). Credentials remain owned by the CLI. */
-import { execFile } from 'node:child_process'
-import { access, readFile, stat } from 'node:fs/promises'
-import { constants } from 'node:fs'
-import { delimiter, isAbsolute, join, relative, resolve } from 'node:path'
+import { bridgeCode, resolveNpmCli, runCliJson } from './cli-bridge.js'
 
 export const QWEN_CLI_ARGS = Object.freeze(['usage', 'summary', '--format', 'json'])
+export const QWEN_SUBSCRIPTION_ARGS = Object.freeze(['subscription', 'status', '--format', 'json'])
 const MESSAGES = {
   zh: {
     missing: '未找到千问 CLI。请在 DSH 所在机器安装 @qianwenai/qianwen-cli，运行 qianwen auth login，并重启 DSH 以更新 PATH。',
@@ -60,51 +58,56 @@ export function parseQwenSummary(payload, locale = 'zh') {
   return { windows }
 }
 
-/** Resolve PATH without a shell; Windows npm .cmd shims are never evaluated. */
-export async function resolveQwenCli({ env = process.env, platform = process.platform } = {}) {
-  const pathValue = Object.entries(env).find(([key]) => key.toLowerCase() === 'path')?.[1] ?? ''
-  for (const raw of pathValue.split(platform === 'win32' ? ';' : delimiter)) {
-    const dir = raw.replace(/^"(.*)"$/, '$1')
-    // Empty/relative PATH entries must not execute a workspace-supplied program.
-    if (!isAbsolute(dir)) continue
-    if (platform === 'win32') {
-      // npm global installs put the package next to the Windows shim.
-      const root = join(dir, 'node_modules', '@qianwenai', 'qianwen-cli')
-      try {
-        const meta = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
-        const bin = meta.bin?.qianwen
-        if (meta.name === '@qianwenai/qianwen-cli' && typeof bin === 'string') {
-          const target = resolve(root, bin), rel = relative(root, target)
-          if (rel && !rel.startsWith('..') && !isAbsolute(rel) && (await stat(target)).isFile()) {
-            return { file: process.execPath, args: [target] }
-          }
-        }
-      } catch { /* Try the next installed executable. */ }
+// CLI individual subscriptions expose monthly/weekly percentages even when the
+// legacy usage summary says subscribed=false (#260). usedPct is already 0–100.
+// Source: QianWen-AI/qianwen-cli@054b874, src/services/tokenplan-service.ts.
+export function parseQwenSubscription(payload, locale = 'zh') {
+  if (!record(payload)) throw fail(locale, 'invalid')
+  const plan = payload.individual
+  if (!record(plan) || plan.status !== 'active') throw fail(locale, 'unavailable')
+  const windows = {}
+  for (const [key, field] of [['monthly', 'monthlyCredits'], ['weekly', 'weeklyCredits']]) {
+    const quota = plan[field]
+    if (quota == null) continue
+    if (!record(quota) || !finite(quota.usedPct) || quota.usedPct > 100) throw fail(locale, 'invalid')
+    let resetsAt = ''
+    if (quota.resetTime != null) {
+      if (typeof quota.resetTime !== 'string' || !Number.isFinite(Date.parse(quota.resetTime))) throw fail(locale, 'invalid')
+      resetsAt = new Date(quota.resetTime).toISOString()
     }
-    const file = join(dir, platform === 'win32' ? 'qianwen.exe' : 'qianwen')
-    try {
-      await access(file, platform === 'win32' ? constants.F_OK : constants.X_OK)
-      if ((await stat(file)).isFile()) return { file, args: [] }
-    } catch { /* Not installed in this PATH entry. */ }
+    windows[key] = { percent: quota.usedPct, resetsAt }
+    if (quota.total != null) {
+      if (!finite(quota.total) || quota.total <= 0) throw fail(locale, 'invalid')
+      const label = locale === 'en' ? `${key === 'monthly' ? 'Monthly' : 'Weekly'} total` : `${key === 'monthly' ? '月' : '周'}总额度`
+      // Upstream omits unknown absolute used/remaining Credits. Keep that boundary
+      // instead of presenting Credits derived from a rounded percentage as exact.
+      windows[key + 'Credits'] = { resetsAt: '', text: `${label}: ${quota.total.toLocaleString('en-US', { maximumFractionDigits: 6 })} Credits (CLI)` }
+    }
   }
-  return null
+  if (!Object.keys(windows).length) throw fail(locale, 'unavailable')
+  return { windows }
 }
 
+/** Resolve PATH without a shell; Windows npm .cmd shims are never evaluated. */
+export const resolveQwenCli = (options = {}) =>
+  resolveNpmCli({ packageName: '@qianwenai/qianwen-cli', binName: 'qianwen', ...options })
 export async function queryQwenCli(locale = 'zh', options = {}) {
   const command = await resolveQwenCli(options)
   if (!command) throw fail(locale, 'missing')
   const { env = process.env, signal, timeoutMs = 15000, maxBuffer = 1024 * 1024 } = options
-  const stdout = await new Promise((done, reject) => {
-    const child = execFile(command.file, [...command.args, ...QWEN_CLI_ARGS], {
-      encoding: 'utf8', windowsHide: true, shell: false, env, signal, timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer,
-    }, (error, out) => {
+  const run = async args => {
+    try {
+      return await runCliJson({ ...command, args: [...command.args, ...args], env, signal, timeoutMs, maxBuffer })
+    } catch (error) {
       // Never expose child output, command paths or credential-bearing errors.
-      if (error) reject(fail(locale, error.code === 2 ? 'auth' : error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER' ? 'invalid' : error.killed ? 'timeout' : 'failed'))
-      else done(out)
-    })
-    child.stdin?.end()
-  })
-  let payload
-  try { payload = JSON.parse(stdout) } catch { throw fail(locale, 'invalid') }
-  return parseQwenSummary(payload, locale)
+      throw fail(locale, bridgeCode(error, { authExitCode: 2 }))
+    }
+  }
+  const payload = await run(QWEN_CLI_ARGS)
+  try {
+    return parseQwenSummary(payload, locale)
+  } catch (error) {
+    if (!['unavailable', 'invalid'].includes(error.code)) throw error
+  }
+  return parseQwenSubscription(await run(QWEN_SUBSCRIPTION_ARGS), locale)
 }

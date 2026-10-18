@@ -7,7 +7,7 @@
  * modlens-go-ds4f,上游不再产生独立的非包装流),唯一到达的 usage 也被丢弃,
  * 整单漏计(#76 实测:会话日志有 usage,账本 sessions=0,今日费用恒 ¥0)。
  *
- * 修复:改用指纹窗口去重。同一会话内,(model, 五桶逐位指纹) 相同的样本在
+ * 修复:改用指纹窗口去重。同一会话内,(上游 provider, model, 五桶逐位指纹) 相同的样本在
  * 窗口期(默认 10s,包装层与上游两次分发的间隔量级)内只入账一次:
  *  - 非包装样本只查「已入账的改挂样本」:命中 = 包装层先到的转发对,跳过;
  *    合法的两次同量普通调用互不去重(与旧行为一致,零回归)。
@@ -27,18 +27,19 @@ import { isWrapperProviderId, wrapperUpstreamProvider } from './pricing.js'
 export const USAGE_DEDUP_WINDOW_MS = 10_000
 
 /**
- * (model, 五桶) 指纹:逐位精确比较。包装转发的双份 usage 实测逐位相同
+ * (上游 provider, model, 五桶) 指纹:逐位精确比较。包装转发的双份 usage 实测逐位相同
  * (issue #48 报告「同 token 逐位相同 ×3」),无需模糊。
  */
-export function usageFingerprint(model, buckets) {
-  return [
+export function usageFingerprint(model, buckets, provider) {
+  return JSON.stringify([
+    String(provider ?? '').trim().toLowerCase().replace(/^llm-/, ''),
     String(model ?? ''),
     buckets?.input ?? 0,
     buckets?.output ?? 0,
     buckets?.cacheRead ?? 0,
     buckets?.cacheWrite ?? 0,
     buckets?.reasoning ?? 0,
-  ].join('|')
+  ])
 }
 
 /**
@@ -59,12 +60,16 @@ export function createUsageDeduper({ windowMs = USAGE_DEDUP_WINDOW_MS, now = Dat
     }
   }
 
-  // 会话条目懒裁剪:条目在窗口内必然被访问到(有活跃指纹),把窗口外彻底
-  // 空掉的条目删除即可让 Map 收敛到活跃会话量级。超过阈值才扫描一次,
-  // 摊薄每次入账的开销。
-  const pruneIfNeeded = () => {
+  // 不再访问的会话也要清理过期指纹。登记本次调用后再裁剪，避免把尚未
+  // 写入指纹的新会话当作空条目删除，使超过阈值后的转发对重复入账。
+  let nextPruneAt = 0
+  const pruneIfNeeded = t => {
     if (sessions.size <= 1024) return
+    if (t < nextPruneAt) return
+    nextPruneAt = t + windowMs
     for (const [key, entry] of sessions) {
+      sweep(entry.plain, t)
+      sweep(entry.remapped, t)
       if (entry.plain.size === 0 && entry.remapped.size === 0) sessions.delete(key)
     }
   }
@@ -86,7 +91,7 @@ export function createUsageDeduper({ windowMs = USAGE_DEDUP_WINDOW_MS, now = Dat
       const effective = wrapped ? (wrapperUpstreamProvider(prov) ?? prov) : prov
       const key = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : ''
       const t = Number.isFinite(atMs) && atMs > 0 ? atMs : now()
-      const fp = usageFingerprint(model, buckets)
+      const fp = usageFingerprint(model, buckets, effective)
       let entry = sessions.get(key)
       if (entry === undefined) {
         entry = { plain: new Map(), remapped: new Map() }
@@ -94,13 +99,13 @@ export function createUsageDeduper({ windowMs = USAGE_DEDUP_WINDOW_MS, now = Dat
       }
       sweep(entry.plain, t)
       sweep(entry.remapped, t)
-      pruneIfNeeded()
       const book = wrapped ? entry.remapped : entry.plain
       // 包装样本与普通样本、改挂样本都互斥;普通样本只与改挂样本互斥。
       if (wrapped ? (entry.plain.has(fp) || entry.remapped.has(fp)) : entry.remapped.has(fp)) {
         return null
       }
       book.set(fp, t)
+      pruneIfNeeded(t)
       if (book.size > maxEntries) {
         // 容量护栏:淘汰最旧条目(窗口语义只关心最近的转发对)。
         let oldestFp = null

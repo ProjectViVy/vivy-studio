@@ -1,20 +1,23 @@
 /**
  * Host-feed subscriptions (extracted from Sidebar.tsx, behavior identical):
- * the WebSocket pushes (agent terminals, agent opens) and the session-list
- * driven auto-activation triggers (subagent, background jobs, topology
+ * the WebSocket push (agent opens) and the session-list / job-list driven
+ * auto-activation triggers (subagent, background jobs, topology
  * jump-back). All of it reacts to the host's live feeds for the CURRENT
  * session; the sidebar shell only consumes the returned jump-back ref.
  */
 import { useEffect, useRef } from 'react'
-import type { Context, SidebarSessionList } from '../../context-types.ts'
-import { mirrorAgentWaits, reconcileAgentTerminals, type SidebarStore } from '../state.ts'
+import type { Context, SidebarJobView, SidebarSessionList } from '../../context-types.ts'
+import type { SidebarStore } from '../state.ts'
 import { isNarrowWidth } from '../breakpoints.ts'
+import { hostWebSocketUrl } from '../host-route-url.ts'
 import { detectNewDirectSubagent } from '../subagent-detect.ts'
 import { detectNewJob } from '../subagent-jobs.ts'
+import { clientJobs, useJobsSnapshot } from '../jobs-client.ts'
+import { mountedSessionId } from '../native/surface.ts'
 import { t } from '../locales.ts'
 
-/** How many consecutive reconnect failures stop the agent-terminals push loop
- * (mirror of the terminal view's own cap; the loop restarts on session switch). */
+/** How many consecutive reconnect failures stop the agent-opens push loop
+ * (the loop restarts on session switch). */
 const FAILURE_LIMIT = 3
 
 /**
@@ -28,14 +31,17 @@ const FAILURE_LIMIT = 3
 const AUTO_OPEN_DEBOUNCE_MS = 500
 
 /**
- * The native column's public face, as this module reaches it. Both actions
- * act on the session whose surface is MOUNTED (the controller reads its
- * binding), which is why the park below is gated on the target session being
- * the on-screen one.
+ * The native column's public face, as this module reaches it. Every reader
+ * acts on the session whose surface is MOUNTED (the controller reads its
+ * binding), which is why both gates below are gated on the target session
+ * being the on-screen one.
  */
 interface NativeColumnFace {
   isExpanded?: () => boolean
   toggleExpanded?: () => void
+  /** The active tab of the active pane (`ISidebarRight.active`): which page the
+   *  reader is looking at. Absent on a host older than the reader gate. */
+  active?: () => { kind?: string } | undefined
 }
 
 /**
@@ -56,18 +62,67 @@ interface NativeColumnFace {
  * when the activation FIRES (the debounced subagent trigger included), so a
  * resize while arming is honoured.
  *
+ * A background activation must not replace the page the reader is on either,
+ * on ANY viewport: the host's open focuses what it opens, so "activate" means
+ * "take the column over", and doing that while the reader is in a document
+ * (a file, a diff, a side chat) throws their page out of view on every new
+ * subagent / background job — the one thing a DELAYED trigger may never do.
+ * The gate is the wide-viewport twin of the park below and asks the same
+ * question — is the column in use? — of the same session: a COLLAPSED column
+ * shows nothing, so its tabs may be re-pointed freely (that is where the two
+ * switches still land, and where the narrow park keeps them), while an
+ * EXPANDED one showing a page other than the Tasks page is in use and is left
+ * alone. A column already on the Tasks page is re-focused in place as before
+ * (single-instance semantics make it a no-op).
+ *
+ * Leaving it at that would DROP the event: the page the background work
+ * belongs to must still be created, it just may not take the column over.
+ * So a gated activation opens the same page with `reveal: false` — the host
+ * places the tab without focusing it (`openContent`'s `revealIfOpened: false`
+ * suppresses exactly the focus op; the page kind has no focus path of its own,
+ * and re-opening a page that IS already there is a focus either way, which is
+ * precisely what the gate refuses) — and marks the tab type unread, which is
+ * the dot the reader follows to it later. The two halves are one change:
+ * without the dot the tab would be created invisibly, and without the open
+ * there would be nothing for the dot to point at.
+ *
  * @param ctx - the client context (`ctx.sidebarRight` + `ctx.betterSidebar`).
+ * @param store - the plugin store (the unread dot lives in the session state).
  * @param sessionId - the session the feed reports the activity for.
- * @param options.background - `true` for background activity (parks on narrow
- *   viewports); `false` for the explicit topology jump-back, which is a user
- *   gesture and always leaves the column as the host expanded it.
+ * @param options.background - `true` for background activity (refuses a
+ *   column the reader is using, parks on narrow viewports); `false` for the
+ *   explicit topology jump-back, which is a user gesture and always leaves the
+ *   column as the host expanded it.
  */
-function activateTasksPage(ctx: Context, sessionId: string, options: { background: boolean }): void {
+function activateTasksPage(
+  ctx: Context,
+  store: SidebarStore,
+  sessionId: string,
+  options: { background: boolean },
+): void {
   const column = ctx.get('sidebarRight') as unknown as NativeColumnFace | undefined
+  // The face acts on the MOUNTED session: both gates below are only meaningful
+  // (and only safe) when the activation targets the one on screen. "On screen"
+  // is the native surface's own mounted seat — the session list has no
+  // current-session field — and an absent seat (a global panel, or a host
+  // without the feed) reads as "not this session": the plugin then leaves the
+  // column alone rather than reading or toggling one it is not drawing.
+  const onScreen = mountedSessionId(ctx) === sessionId
+  // Do not take over the page the reader is looking at (see the docblock).
+  if (options.background && onScreen && column?.isExpanded?.() === true) {
+    const shown = column.active?.()
+    if (shown !== undefined && shown.kind !== 'subagent') {
+      // The page is still created — the event is never dropped — but it lands
+      // in the background and raises the dot instead of the column.
+      ctx.get('betterSidebar')?.openTab({ type: 'subagent', title: t('subagent'), reveal: false })
+      // The dot belongs to the session the work is in, which is the current
+      // one (the gate above proved this seat is the mounted session).
+      store.markUnread('subagent')
+      return
+    }
+  }
   const park = options.background
-    // The face acts on the MOUNTED session: parking is only meaningful (and
-    // only safe) when the activation targets the one on screen.
-    && ctx.sessions.list.getSnapshot().current === sessionId
+    && onScreen
     && isNarrowWidth(window.innerWidth)
     // Only a column the user had COLLAPSED is put back: an expanded one is in
     // use, and closing it under the user would be worse than the takeover.
@@ -85,74 +140,12 @@ export function useHostFeeds(feeds: {
   const { ctx, store, sessionList, sessionId } = feeds
 
   /**
-   * Agent terminals push: subscribe to the host's live list of agent-owned
-   * terminals for this session (created by the model through the
-   * `terminal_create` tool). The host pushes a JSON array on every
-   * create / close / exit; the sidebar reconciles the list into tabs
-   * (id `agent:<uuid>`, title from the agent). A disconnected socket
-   * retries with a short backoff so a refresh or transient drop reattaches
-   * the same shell without losing the agent's work — capped like the
-   * terminal view's own reconnect loop, so a refused endpoint never spins
-   * forever (the next session switch restarts the loop).
-   * While the terminal tab type is disabled in settings, pushes add / remove
-   * no tabs — but the authoritative wait map is STILL mirrored (see the
-   * branch below); re-enabling makes the next push converge on both.
-   */
-  useEffect(() => {
-    if (sessionId === undefined) return
-    let socket: WebSocket | null = null
-    let retry: number | undefined
-    let closed = false
-    let failures = 0
-    const connect = (): void => {
-      if (closed) return
-      const url = new URL('/sidebar/ws/agent-terminals', location.origin)
-      url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
-      url.search = new URLSearchParams({ sessionId }).toString()
-      socket = new WebSocket(url.toString())
-      socket.onmessage = (event) => {
-        if (typeof event.data !== 'string') return
-        try {
-          const list = JSON.parse(event.data) as Array<{ uuid: string; title: string; command: string; exited: boolean; waiting?: { needle: string; since: number } | null }>
-          if (!Array.isArray(list)) return
-          store.reduce(s => ctx.get('betterSidebar')?.isTabEnabled('terminal') === false
-            // Terminal tabs are disabled: skip tab add/remove reconciliation,
-            // but STILL mirror the authoritative wait map — a wait resolving
-            // during the disabled window must clear its banner state, or a
-            // re-enabled terminal keeps a stale banner until the next
-            // unrelated push.
-            ? mirrorAgentWaits(s, list)
-            : reconcileAgentTerminals(s, list))
-        } catch {
-          // Malformed push: ignore (the next push will reconcile).
-        }
-      }
-      socket.onclose = () => {
-        if (closed) return
-        failures += 1
-        if (failures >= FAILURE_LIMIT) {
-          console.error('[dsh-better-sidebar] agent-terminals connection failed; stopping reconnect loop', sessionId)
-          return
-        }
-        retry = window.setTimeout(connect, 2000)
-      }
-      socket.onerror = () => { socket?.close() }
-    }
-    connect()
-    return () => {
-      closed = true
-      window.clearTimeout(retry)
-      socket?.close()
-    }
-  }, [sessionId, ctx, store])
-
-  /**
    * Agent opens push: subscribe to the host's `sidebar_open` requests for
    * this session (the model actively opens a file / folder / HTTP(S) page).
    * The host pushes one JSON request per open; the sidebar routes it to the
    * matching built-in tab: a file opens in the editor (per-path dedupe), a
    * folder opens a file window whose tree is rooted at the folder
-   * (`meta.dir`), and a URL opens in the browser tab. A disconnected socket
+   * (`meta.dir`), and a URL opens in DSH's own browser tab type. A disconnected socket
    * retries with a short backoff (mirror of the agent-terminals loop): the
    * host queue keeps undelivered requests and replays them on the first
    * attach, so a refresh or a session switch lands the opens the model
@@ -168,8 +161,7 @@ export function useHostFeeds(feeds: {
     let failures = 0
     const connect = (): void => {
       if (closed) return
-      const url = new URL('/sidebar/ws/agent-opens', location.origin)
-      url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:'
+      const url = hostWebSocketUrl('sidebar/ws/agent-opens')
       url.search = new URLSearchParams({ sessionId }).toString()
       socket = new WebSocket(url.toString())
       socket.onmessage = (event) => {
@@ -183,7 +175,14 @@ export function useHostFeeds(feeds: {
           const scope = { sessionId }
           const title = typeof request.title === 'string' && request.title !== '' ? request.title : undefined
           if (request.kind === 'url') {
-            ctx.get('betterSidebar')?.openTab({ type: 'browser', url: request.target, title }, scope)
+            // DSH's own browser tab type (absent from the plugin's registry
+            // since 0.20.0); an unregistered kind throws, so the agent-open
+            // path degrades to doing nothing rather than breaking the push.
+            try {
+              ctx.get('sidebarRight')?.openTab('browser', { params: { url: request.target } })
+            } catch {
+              // Host without a browser tab type: nothing to open into.
+            }
           } else if (request.kind === 'folder') {
             ctx.get('betterSidebar')?.openTab({
               type: 'editor',
@@ -226,10 +225,16 @@ export function useHostFeeds(feeds: {
    * focus an existing tab in place; a new tab lands in that column and is
    * never duplicated. Landing it EXPANDS the column on wide viewports, while
    * a narrow viewport (where the host draws that column fullscreen) parks the
-   * tab instead of taking the screen over — see {@link activateTasksPage}.
+   * tab instead of taking the screen over — see {@link activateTasksPage},
+   * which also refuses a column the reader has expanded onto another page.
    * Switching to a session that already has subagents never triggers — its
    * baseline starts at the current count — so a deliberate layout is never
    * fought.
+   *
+   * MOBILE: while the viewport is narrow (the plugin's own bracket), the
+   * `mobileNoAutoOpen` preference suppresses this takeover entirely — on a
+   * phone the Tasks page costs the whole screen, and the reader has not asked
+   * for it. The viewport is read when the trigger FIRES, like the park gate.
    *
    * The decision is DEBOUNCED (AUTO_OPEN_DEBOUNCE_MS): a Side Chat thread
    * is also a subagent-origin child, and its 'Side: ' title lands one frame
@@ -251,8 +256,9 @@ export function useHostFeeds(feeds: {
       autoOpenPendingRef.current = null
       if (!detectNewDirectSubagent(baseline, ctx.sessions.list.getSnapshot(), sessionId)) return
       if (!store.getPrefs().autoOpenSubagent) return
+      if (store.getPrefs().mobileNoAutoOpen && isNarrowWidth(window.innerWidth)) return
       if (ctx.get('betterSidebar')?.isTabEnabled('subagent') === false) return
-      activateTasksPage(ctx, sessionId, { background: true })
+      activateTasksPage(ctx, store, sessionId, { background: true })
     }, AUTO_OPEN_DEBOUNCE_MS)
     autoOpenPendingRef.current = { baseline, timer }
   }, [sessionList, sessionId, store, ctx])
@@ -266,25 +272,58 @@ export function useHostFeeds(feeds: {
 
   /**
    * Job auto-activation: the moment a NEW background job appears for the
-   * current conversation (a job id the previous snapshot lacked), the
+   * current conversation (a job id the previous read of its list lacked), the
    * auto-open pref is on, and the Tasks tab type is enabled, activate the Tasks
    * page that contains the background-jobs section — in DSH's native right
    * Sidebar, expanded on wide viewports and parked on narrow ones exactly like
-   * the subagent trigger ({@link activateTasksPage}). Unlike that trigger
+   * the subagent trigger ({@link activateTasksPage}, which leaves a column the
+   * reader has expanded onto another page untouched). Unlike that trigger
    * (0 → N only), ANY new job id triggers: the agent may start several jobs in
-   * one session, and each should surface. A fresh page load never triggers —
-   * its baseline starts at the current snapshot.
+   * one session, and each should surface.
+   *
+   * MOBILE: `mobileNoAutoOpen` suppresses this one too on a narrow viewport
+   * (one switch for both triggers — a phone should not be taken over by either
+   * kind of background work).
+   *
+   * The roster is PUSHED by the host's own client jobs service: one
+   * reference-counted `watchRows` stream for the current session replaces the
+   * 3s `jobs.list` poll this used to run. A fresh page load never triggers —
+   * the FIRST frame only arms the baseline — and a deployment without the
+   * jobs service leaves the baseline unarmed, so the first roster that does
+   * arrive is never mistaken for new work.
+   *
+   * `detectNewJob` also compares against the moment the watch STARTED: the
+   * first frame of a session that already had running jobs must not surface
+   * them as new work.
    */
-  const jobBaselineRef = useRef<SidebarSessionList | undefined>(undefined)
+  const jobsService = clientJobs(ctx)
+  const jobsSnapshot = useJobsSnapshot(jobsService)
+  const jobBaselineRef = useRef<readonly SidebarJobView[] | undefined>(undefined)
+  const jobWatchStartRef = useRef<number | undefined>(undefined)
   useEffect(() => {
+    if (jobsService === undefined || sessionId === undefined) return
+    const release = jobsService.watchRows(sessionId)
+    // A session switch voids the previous session's baseline AND its clock.
+    jobWatchStartRef.current = Date.now()
+    jobBaselineRef.current = undefined
+    return () => {
+      release()
+      jobBaselineRef.current = undefined
+      jobWatchStartRef.current = undefined
+    }
+  }, [jobsService, sessionId])
+  useEffect(() => {
+    if (jobsService === undefined || sessionId === undefined) return
+    const rows = jobsSnapshot.rows[sessionId] ?? []
     const prev = jobBaselineRef.current
-    jobBaselineRef.current = sessionList
-    if (sessionId === undefined || prev === undefined) return
-    if (!detectNewJob(prev, sessionList, sessionId)) return
+    jobBaselineRef.current = rows
+    if (prev === undefined) return
+    if (!detectNewJob(prev, rows, jobWatchStartRef.current)) return
     if (!store.getPrefs().autoOpenJobs) return
+    if (store.getPrefs().mobileNoAutoOpen && isNarrowWidth(window.innerWidth)) return
     if (ctx.get('betterSidebar')?.isTabEnabled('subagent') === false) return
-    activateTasksPage(ctx, sessionId, { background: true })
-  }, [sessionList, sessionId, store, ctx])
+    activateTasksPage(ctx, store, sessionId, { background: true })
+  }, [jobsService, jobsSnapshot, sessionId, store, ctx])
 
   /**
    * Topology jump-back: clicking a subagent node on the Subagent page calls
@@ -303,7 +342,7 @@ export function useHostFeeds(feeds: {
     const pending = subagentJumpRef.current
     if (pending === undefined || sessionId !== pending) return
     subagentJumpRef.current = undefined
-    activateTasksPage(ctx, sessionId, { background: false })
+    activateTasksPage(ctx, store, sessionId, { background: false })
   }, [sessionId, store, ctx])
 
   return { subagentJumpRef }
