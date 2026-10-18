@@ -2,7 +2,10 @@
 
 First-party DSH shell skin for the independent **Vivy Studio** app.
 
-- Product name: Vivy Studio (title, sidebar wordmark, welcome)
+- Product name: Nierland (tab title, sidebar wordmark, tab icon). The DSH
+  welcome dialog still reads "Vivy Studio" — not part of the brand lockup.
+- `index.js` holds the name once (`PRODUCT`); `theme.css` carries the
+  `__VIVY_PRODUCT__` token that it substitutes at boot
 - Theme: Fluorite (concert-hall paper / night ink, teal accent)
 - Loaded as a sealed `vivy-studio` profile bundle — not a `--patch` overlay
 - Host `webServer.tapIndex` injects CSS + title script. Do not insert nodes into React trees.

@@ -16,7 +16,12 @@
   --vivy-line: oklch(0.4 0.02 70 / 0.12);
   --vivy-serif: "Source Han Serif SC", "Noto Serif SC", "Songti SC", "STSong",
     "Times New Roman", serif;
-  --vivy-display: "Songti SC", "STSong", "Source Han Serif SC", "Georgia", serif;
+  /* Latin display face first: Georgia and Palatino Linotype carry real
+     italics, whereas this stack previously fell through to Times New Roman on
+     Windows (no Songti SC / STSong / Source Han Serif SC there) and the brand
+     got a synthesised oblique. CJK serifs follow for any CJK text. */
+  --vivy-display: "Georgia", "Palatino Linotype", "Noto Serif SC",
+    "Source Han Serif SC", "Songti SC", "STSong", serif;
   --vivy-sans: "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI",
     sans-serif;
 }
@@ -263,34 +268,43 @@ button:has(svg[viewBox="26 0 156 24"]) {
   gap: 9px !important;
 }
 
+/* Brand lockup. The mark is the fluorite gem (no letter: the letter used to
+   read "V" while the wordmark read "__VIVY_PRODUCT__"). The wordmark is Latin
+   caps on the sans stack with wide tracking; --vivy-display resolves to
+   Times New Roman on Windows, so it is no longer used for the brand.
+   __VIVY_PRODUCT__ is substituted at boot by index.js from its PRODUCT
+   constant — keep the literal out of this file (single source of truth). */
 button:has(svg[viewBox="0 0 182 24"])::before,
 button:has(svg[viewBox="26 0 156 24"])::before,
 [class*="railMark"]::before {
-  content: "V";
-  width: 22px;
-  height: 22px;
+  content: "";
+  width: 19px;
+  height: 19px;
   flex: none;
-  border-radius: 2px;
-  background: var(--vivy-fluorite);
-  color: #fffaf3;
-  font-family: var(--vivy-display);
-  font-size: 15px;
-  font-weight: 600;
-  font-style: italic;
-  line-height: 22px;
-  text-align: center;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath fill='%232aa8a4' d='M10 1.6 18.4 10 10 18.4 1.6 10Z'/%3E%3Cpath fill='%23fbf7f0' d='M10 6.3 13.7 10 10 13.7 6.3 10Z'/%3E%3C/svg%3E")
+    center / contain no-repeat;
+}
+
+body[data-ds-dark-theme] button:has(svg[viewBox="0 0 182 24"])::before,
+body[data-ds-dark-theme] button:has(svg[viewBox="26 0 156 24"])::before,
+body[data-ds-dark-theme] [class*="railMark"]::before {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20'%3E%3Cpath fill='%235fd4cf' d='M10 1.6 18.4 10 10 18.4 1.6 10Z'/%3E%3Cpath fill='%231a1613' d='M10 6.3 13.7 10 10 13.7 6.3 10Z'/%3E%3C/svg%3E");
 }
 
 button:has(svg[viewBox="0 0 182 24"])::after,
 button:has(svg[viewBox="26 0 156 24"])::after {
-  content: "Nierland";
+  content: "__VIVY_PRODUCT__";
   color: var(--dsw-alias-label-primary);
-  font-family: var(--vivy-display);
-  font-size: 17px;
-  font-weight: 520;
-  font-style: italic;
-  letter-spacing: 0.01em;
+  font-family: var(--vivy-sans);
+  font-size: 13.5px;
+  font-weight: 600;
+  font-style: normal;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
   white-space: nowrap;
+  /* Tracking adds a trailing space after the last letter; pull it back so the
+     wordmark stays optically centred against the mark. */
+  margin-right: -0.22em;
 }
 
 svg[viewBox="0 0 23.16 17.04"],
@@ -345,7 +359,7 @@ ellipse[fill="#6187D8"] {
 }
 
 [class*="dialog"] h2[class*="title"]::after {
-  content: "Vivy Studio";
+  content: "__VIVY_PRODUCT__";
   display: block;
   font-family: var(--vivy-display);
   font-size: 20px;
@@ -365,7 +379,7 @@ ellipse[fill="#6187D8"] {
 }
 
 [class*="copy"] p:first-of-type::after {
-  content: "Vivy Studio 是独立应用。它管理 Vivy 的开发与分发全生命周期。日常 vivy.exe 是产物，不是宿主。开发发动机可替换；你看见的名字是 Vivy Studio。";
+  content: "__VIVY_PRODUCT__ 是独立应用。它管理 Vivy 的开发与分发全生命周期。日常 vivy.exe 是产物，不是宿主。开发发动机可替换；你看见的名字是 __VIVY_PRODUCT__。";
   display: block;
   font-size: 14px;
   line-height: 24px;

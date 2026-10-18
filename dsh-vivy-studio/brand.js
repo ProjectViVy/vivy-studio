@@ -1,5 +1,6 @@
 (() => {
-  const PRODUCT = "Vivy Studio"
+  // Injected by index.js so the product name has a single source.
+  const PRODUCT = window.__VIVY_PRODUCT__ || "Vivy Studio"
   const rename = () => {
     const raw = document.title || ""
     if (raw === "") {
